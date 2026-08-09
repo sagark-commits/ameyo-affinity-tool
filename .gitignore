@@ -1,0 +1,14 @@
+# Logs
+*.log
+/var/tmp/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Backups created on target hosts (if copied back)
+*.bak.*
