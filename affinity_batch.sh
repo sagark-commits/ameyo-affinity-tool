@@ -8,7 +8,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INVENTORY="${SCRIPT_DIR}/inventory/blr-servers.csv"
 SSH_USER="${SSH_USER:-root}"
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes)
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -o LogLevel=ERROR)
+# -n keeps ssh from consuming the inventory on stdin (it would eat the CSV loop)
+SSH_RUN=(ssh -n -q "${SSH_OPTS[@]}")
 REMOTE_DIR="/opt/ameyo-affinity-tool"
 APPLY=0
 VERIFY=0
@@ -91,20 +93,20 @@ run_one() {
     echo "---- $host ($ip) role=$role pair=$pair ----"
     echo "[$(date '+%F %T')] deploy tool -> ${SSH_USER}@${ip}:${REMOTE_DIR}"
 
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "mkdir -p '${REMOTE_DIR}/profiles'" \
+    "${SSH_RUN[@]}" "${SSH_USER}@${ip}" "mkdir -p '${REMOTE_DIR}/profiles'" \
       || { echo "SSH FAILED: $host ($ip)"; return 1; }
 
-    scp "${SSH_OPTS[@]}" \
+    scp -q "${SSH_OPTS[@]}" \
       "${SCRIPT_DIR}/affinity_tool.sh" \
       "${SSH_USER}@${ip}:${REMOTE_DIR}/affinity_tool.sh" >/dev/null
 
-    # profiles optional
-    if [[ -d "${SCRIPT_DIR}/profiles" ]]; then
-      scp "${SSH_OPTS[@]}" -r "${SCRIPT_DIR}/profiles/." \
+    # profiles optional; newer scp (SFTP mode) rejects a bare "." source
+    if compgen -G "${SCRIPT_DIR}/profiles/*" >/dev/null 2>&1; then
+      scp -q "${SSH_OPTS[@]}" "${SCRIPT_DIR}"/profiles/* \
         "${SSH_USER}@${ip}:${REMOTE_DIR}/profiles/" >/dev/null || true
     fi
 
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "chmod +x '${REMOTE_DIR}/affinity_tool.sh'"
+    "${SSH_RUN[@]}" "${SSH_USER}@${ip}" "chmod +x '${REMOTE_DIR}/affinity_tool.sh'"
 
     if [[ $VERIFY -eq 1 ]]; then
       remote_cmd="sudo '${REMOTE_DIR}/affinity_tool.sh' --verify"
@@ -123,7 +125,7 @@ run_one() {
 
     echo "[$(date '+%F %T')] RUN: $remote_cmd"
     # shellcheck disable=SC2029
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "$remote_cmd" || rc=$?
+    "${SSH_RUN[@]}" "${SSH_USER}@${ip}" "$remote_cmd" || rc=$?
     echo "[$(date '+%F %T')] exit=$rc"
     return "$rc"
   } >"$logfile" 2>&1
@@ -135,7 +137,8 @@ FAIL=0
 OK=0
 SKIP=0
 
-while IFS= read -r line || [[ -n "$line" ]]; do
+while IFS= read -r line <&3 || [[ -n "$line" ]]; do
+  line="${line%$'\r'}"
   [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
   [[ "$line" =~ ^hostname, ]] && continue
 
@@ -178,7 +181,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
       FAIL=$((FAIL + 1))
     fi
   fi
-done < "$INVENTORY"
+done 3< "$INVENTORY"
 
 if [[ $PARALLEL -eq 1 ]]; then
   for i in "${!PIDS[@]}"; do

@@ -34,8 +34,10 @@ declare -a IRQ_ETH=()
 declare -a IRQ_DISK=()
 declare -a IRQ_TEL=()
 declare -A PLAN_IRQ=()           # irq -> cpu
+declare -A PLAN_IRQ_CLASS=()     # irq -> eth|disk|telephony
 declare -A PLAN_SVC=()           # service -> cpu list string
 DEFAULT_AFFINITY_CPU=0
+IRQ_CORES_MAX="${IRQ_CORES_MAX:-4}"   # max cores per multi-queue device class
 
 usage() {
   cat <<EOF
@@ -176,89 +178,117 @@ detect_cpu() {
   HT_SIBLING=()
   CPU_HEX=()
 
-  [[ -r /proc/cpuinfo ]] || die "/proc/cpuinfo not readable"
+  local -A core_cpus=()   # "pkg:core" -> "cpu,cpu"
+  local -A phys_ids=()
+  local cpudir base cpu core pkg key online
 
-  local -A core_cpus=()   # "phys:core" -> "cpu,cpu"
-  local -A seen_cpu=()
-  local proc="" phys="" core=""
-
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    case "$line" in
-      processor*)
-        proc="$(echo "$line" | awk -F: '{gsub(/ /,"",$2); print $2}')"
-        ;;
-      "physical id"*)
-        phys="$(echo "$line" | awk -F: '{gsub(/ /,"",$2); print $2}')"
-        ;;
-      "core id"*)
-        core="$(echo "$line" | awk -F: '{gsub(/ /,"",$2); print $2}')"
-        if [[ -n "$proc" && -n "$phys" && -n "$core" ]]; then
-          local key="${phys}:${core}"
-          if [[ -n "${core_cpus[$key]:-}" ]]; then
-            core_cpus[$key]="${core_cpus[$key]},${proc}"
-          else
-            core_cpus[$key]="$proc"
-          fi
-          seen_cpu[$proc]=1
-          proc=""; phys=""; core=""
-        fi
-        ;;
-    esac
-  done < /proc/cpuinfo
-
-  # Fallback if topology fields missing
-  if [[ ${#core_cpus[@]} -eq 0 ]]; then
-    local n
-    n="$(nproc --all 2>/dev/null || grep -c ^processor /proc/cpuinfo)"
-    local i
-    for ((i=0; i<n; i++)); do
-      core_cpus["0:$i"]="$i"
-      seen_cpu[$i]=1
+  # Preferred source: sysfs topology (authoritative, lists only online CPUs)
+  if compgen -G "/sys/devices/system/cpu/cpu[0-9]*/topology/core_id" >/dev/null 2>&1; then
+    for cpudir in /sys/devices/system/cpu/cpu[0-9]*; do
+      base="${cpudir##*/}"
+      cpu="${base#cpu}"
+      [[ "$cpu" =~ ^[0-9]+$ ]] || continue
+      if [[ -r "$cpudir/online" ]]; then
+        online="$(cat "$cpudir/online" 2>/dev/null || echo 1)"
+        [[ "$online" == "0" ]] && continue
+      fi
+      [[ -r "$cpudir/topology/core_id" ]] || continue
+      core="$(cat "$cpudir/topology/core_id")"
+      pkg=0
+      [[ -r "$cpudir/topology/physical_package_id" ]] && \
+        pkg="$(cat "$cpudir/topology/physical_package_id")"
+      key="${pkg}:${core}"
+      if [[ -n "${core_cpus[$key]:-}" ]]; then
+        core_cpus[$key]="${core_cpus[$key]},${cpu}"
+      else
+        core_cpus[$key]="$cpu"
+      fi
+      phys_ids[$pkg]=1
+      CPU_LIST+=("$cpu")
     done
   fi
 
-  LOGICAL_CPUS=${#seen_cpu[@]}
-  local -A phys_ids=()
-  local key cpus first rest sib
+  # Fallback: parse /proc/cpuinfo blocks
+  if [[ ${#core_cpus[@]} -eq 0 ]]; then
+    [[ -r /proc/cpuinfo ]] || die "Cannot read CPU topology (/sys and /proc/cpuinfo unavailable)"
+    local proc="" phys="" corei="" line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in
+        processor[[:space:]]*|processor:*)
+          # flush previous block
+          if [[ -n "$proc" ]]; then
+            key="${phys:-0}:${corei:-$proc}"
+            if [[ -n "${core_cpus[$key]:-}" ]]; then
+              core_cpus[$key]="${core_cpus[$key]},${proc}"
+            else
+              core_cpus[$key]="$proc"
+            fi
+            phys_ids["${phys:-0}"]=1
+            CPU_LIST+=("$proc")
+          fi
+          proc="$(echo "$line" | awk -F: '{gsub(/[[:space:]]/,"",$2); print $2}')"
+          phys=""; corei=""
+          ;;
+        "physical id"*)
+          phys="$(echo "$line" | awk -F: '{gsub(/[[:space:]]/,"",$2); print $2}')"
+          ;;
+        "core id"*)
+          corei="$(echo "$line" | awk -F: '{gsub(/[[:space:]]/,"",$2); print $2}')"
+          ;;
+      esac
+    done < /proc/cpuinfo
+    if [[ -n "$proc" ]]; then
+      key="${phys:-0}:${corei:-$proc}"
+      if [[ -n "${core_cpus[$key]:-}" ]]; then
+        core_cpus[$key]="${core_cpus[$key]},${proc}"
+      else
+        core_cpus[$key]="$proc"
+      fi
+      phys_ids["${phys:-0}"]=1
+      CPU_LIST+=("$proc")
+    fi
+  fi
+
+  [[ ${#core_cpus[@]} -gt 0 ]] || die "Failed to determine CPU topology"
+
+  # Sort logical CPU ids
+  local sorted
+  sorted="$(printf '%s\n' "${CPU_LIST[@]}" | sort -n -u)"
+  CPU_LIST=()
+  while IFS= read -r cpu; do [[ -n "$cpu" ]] && CPU_LIST+=("$cpu"); done <<< "$sorted"
+  LOGICAL_CPUS=${#CPU_LIST[@]}
+
+  # One primary (lowest id) per physical core; the rest are HT siblings
+  local cpus first x
+  IS_HT=0
   for key in "${!core_cpus[@]}"; do
-    phys_ids["${key%%:*}"]=1
-    cpus="${core_cpus[$key]}"
+    cpus="$(printf '%s\n' "${core_cpus[$key]//,/$'\n'}" | sort -n -u | paste -sd, -)"
     first="${cpus%%,*}"
     PHYS_PRIMARY+=("$first")
-    if [[ "$cpus" == *,* ]]; then
-      rest="${cpus#*,}"
-      sib="${rest%%,*}"
-      HT_SIBLING[$first]="$sib"
-      HT_SIBLING[$sib]="$first"
-      # extra siblings map to first
-      local x
-      IFS=',' read -ra _arr <<< "$cpus"
-      for x in "${_arr[@]}"; do
-        HT_SIBLING[$x]="${_arr[0]}"
-        [[ "$x" == "${_arr[0]}" ]] || HT_SIBLING[${_arr[0]}]="$x"
-      done
+    local -a sibs=()
+    IFS=',' read -ra sibs <<< "$cpus"
+    if [[ ${#sibs[@]} -gt 1 ]]; then
+      IS_HT=1
+      for x in "${sibs[@]}"; do HT_SIBLING[$x]="$first"; done
+      HT_SIBLING[$first]="${sibs[1]}"
     else
       HT_SIBLING[$first]="$first"
     fi
   done
-  PHYSICAL_CPUS=${#phys_ids[@]}
 
-  # Sort primary cores numerically
-  IFS=$'\n' PHYS_PRIMARY=($(printf '%s\n' "${PHYS_PRIMARY[@]}" | sort -n)); unset IFS
+  PHYSICAL_CPUS=${#phys_ids[@]}
+  sorted="$(printf '%s\n' "${PHYS_PRIMARY[@]}" | sort -n -u)"
+  PHYS_PRIMARY=()
+  while IFS= read -r cpu; do [[ -n "$cpu" ]] && PHYS_PRIMARY+=("$cpu"); done <<< "$sorted"
   CORES_PER_CPU=$(( ${#PHYS_PRIMARY[@]} / (PHYSICAL_CPUS > 0 ? PHYSICAL_CPUS : 1) ))
 
-  local max_sib=0
   local c
-  for c in "${!HT_SIBLING[@]}"; do
-    [[ "${HT_SIBLING[$c]}" != "$c" ]] && max_sib=1
-  done
-  IS_HT=$max_sib
-
-  CPU_LIST=()
-  for ((c=0; c<LOGICAL_CPUS; c++)); do CPU_LIST+=("$c"); done
-
   for c in "${CPU_LIST[@]}"; do
-    CPU_HEX[$c]=$(printf '0x%x' $((1 << c)))
+    if [[ $c -lt 63 ]]; then
+      CPU_HEX[$c]=$(printf '0x%x' $((1 << c)))
+    else
+      CPU_HEX[$c]="(>63)"
+    fi
   done
 
   DEFAULT_AFFINITY_CPU=0
@@ -398,6 +428,7 @@ pool_drop() {
 # -----------------------------------------------------------------------------
 plan_allocation() {
   PLAN_IRQ=()
+  PLAN_IRQ_CLASS=()
   PLAN_SVC=()
 
   local n_phys=${#PHYS_PRIMARY[@]}
@@ -422,34 +453,96 @@ plan_allocation() {
   fi
 
   # --- IRQ CPUs ---
-  if [[ -n "${OV[irq_disk]:-}" ]]; then disk_cpu="${OV[irq_disk]}"
-  else
-    disk_cpu="$(pick_cores 1 "${reserved[@]}" | head -1)"
-    [[ -n "$disk_cpu" ]] && reserved+=("$disk_cpu")
+  # Multi-queue devices get their queues spread over several cores. Collapsing
+  # 40 NIC queues onto one core makes that core the bottleneck under load.
+  local -a disk_cpus=() eth_cpus=() tel_cpus=()
+
+  # How many cores to devote to a device class, given its queue count
+  # Roughly one eighth of the cores per class, so interrupts never eat more
+  # than ~25% of the box; services keep the rest.
+  irq_core_budget() {
+    local queues=$1 cap=$2 n
+    [[ $queues -le 1 ]] && { echo 1; return; }
+    n=$(( n_phys / 8 ))
+    [[ $n -lt 1 ]] && n=1
+    [[ $n -gt $cap ]] && n=$cap
+    [[ $n -gt $queues ]] && n=$queues
+    echo "$n"
+  }
+
+  if [[ -n "${OV[irq_disk]:-}" ]]; then
+    IFS=',' read -ra disk_cpus <<< "${OV[irq_disk]}"
+  elif [[ ${#IRQ_DISK[@]} -gt 0 ]]; then
+    local n_disk
+    n_disk="$(irq_core_budget "${#IRQ_DISK[@]}" "$IRQ_CORES_MAX")"
+    while IFS= read -r c; do [[ -n "$c" ]] && disk_cpus+=("$c"); done \
+      < <(pick_cores "$n_disk" "${reserved[@]}")
+    reserved+=("${disk_cpus[@]}")
   fi
 
   if [[ "$HAS_TELEPHONY" == "yes" ]]; then
-    if [[ -n "${OV[irq_telephony]:-}" ]]; then tel_cpu="${OV[irq_telephony]}"
-    else
-      tel_cpu="$(pick_cores 1 "${reserved[@]}" | head -1)"
-      [[ -n "$tel_cpu" ]] && reserved+=("$tel_cpu")
+    if [[ -n "${OV[irq_telephony]:-}" ]]; then
+      IFS=',' read -ra tel_cpus <<< "${OV[irq_telephony]}"
+    elif [[ ${#IRQ_TEL[@]} -gt 0 ]]; then
+      local n_tel
+      n_tel="$(irq_core_budget "${#IRQ_TEL[@]}" 2)"
+      while IFS= read -r c; do [[ -n "$c" ]] && tel_cpus+=("$c"); done \
+        < <(pick_cores "$n_tel" "${reserved[@]}")
+      reserved+=("${tel_cpus[@]}")
     fi
-    if [[ -n "${OV[irq_ethernet]:-}" ]]; then eth_cpu="${OV[irq_ethernet]}"
-    else eth_cpu=0; fi
-  else
-    if [[ -n "${OV[irq_ethernet]:-}" ]]; then eth_cpu="${OV[irq_ethernet]}"
+    # Doc convention: with a telephony card, ethernet shares CPU 0
+    if [[ -n "${OV[irq_ethernet]:-}" ]]; then
+      IFS=',' read -ra eth_cpus <<< "${OV[irq_ethernet]}"
     else
-      # Prefer a non-0 core for eth when no telephony
-      eth_cpu="$(pick_cores 1 "${reserved[@]}" | head -1)"
-      eth_cpu="${eth_cpu:-0}"
-      [[ -n "$eth_cpu" && "$eth_cpu" != "0" ]] && reserved+=("$eth_cpu")
+      eth_cpus=(0)
+    fi
+  else
+    if [[ -n "${OV[irq_ethernet]:-}" ]]; then
+      IFS=',' read -ra eth_cpus <<< "${OV[irq_ethernet]}"
+    elif [[ ${#IRQ_ETH[@]} -gt 0 ]]; then
+      local n_eth
+      n_eth="$(irq_core_budget "${#IRQ_ETH[@]}" "$IRQ_CORES_MAX")"
+      while IFS= read -r c; do [[ -n "$c" ]] && eth_cpus+=("$c"); done \
+        < <(pick_cores "$n_eth" "${reserved[@]}")
+      [[ ${#eth_cpus[@]} -eq 0 ]] && eth_cpus=(0)
+      reserved+=("${eth_cpus[@]}")
     fi
   fi
 
-  local irq
-  for irq in "${IRQ_DISK[@]:-}"; do [[ -n "$disk_cpu" ]] && PLAN_IRQ[$irq]="$disk_cpu"; done
-  for irq in "${IRQ_ETH[@]:-}"; do [[ -n "$eth_cpu" ]] && PLAN_IRQ[$irq]="$eth_cpu"; done
-  for irq in "${IRQ_TEL[@]:-}"; do [[ -n "$tel_cpu" ]] && PLAN_IRQ[$irq]="$tel_cpu"; done
+  # Round-robin each device's queues across its assigned cores
+  local irq idx=0
+  if [[ ${#disk_cpus[@]} -gt 0 ]]; then
+    idx=0
+    for irq in "${IRQ_DISK[@]:-}"; do
+      [[ -n "$irq" ]] || continue
+      PLAN_IRQ[$irq]="${disk_cpus[$(( idx % ${#disk_cpus[@]} ))]}"
+      PLAN_IRQ_CLASS[$irq]="disk"
+      idx=$((idx + 1))
+    done
+  fi
+  if [[ ${#eth_cpus[@]} -gt 0 ]]; then
+    idx=0
+    for irq in "${IRQ_ETH[@]:-}"; do
+      [[ -n "$irq" ]] || continue
+      PLAN_IRQ[$irq]="${eth_cpus[$(( idx % ${#eth_cpus[@]} ))]}"
+      PLAN_IRQ_CLASS[$irq]="eth"
+      idx=$((idx + 1))
+    done
+  fi
+  if [[ ${#tel_cpus[@]} -gt 0 ]]; then
+    idx=0
+    for irq in "${IRQ_TEL[@]:-}"; do
+      [[ -n "$irq" ]] || continue
+      PLAN_IRQ[$irq]="${tel_cpus[$(( idx % ${#tel_cpus[@]} ))]}"
+      PLAN_IRQ_CLASS[$irq]="telephony"
+      idx=$((idx + 1))
+    done
+  fi
+
+  # Kept for the tiny-box override below
+  disk_cpu="${disk_cpus[0]:-}"
+  eth_cpu="${eth_cpus[0]:-}"
+  tel_cpu="${tel_cpus[0]:-}"
 
   # Remaining physical cores for services
   pool=()
@@ -601,6 +694,24 @@ plan_allocation() {
     done
   fi
 
+  # Services are planned on physical cores. On an HT box the sibling threads of
+  # those cores would otherwise sit idle, so widen each service to both threads.
+  # IRQs deliberately stay on the primary thread only.
+  if [[ $IS_HT -eq 1 ]]; then
+    local svc cpu sib expanded
+    for svc in "${!PLAN_SVC[@]}"; do
+      [[ -n "${PLAN_SVC[$svc]}" ]] || continue
+      [[ "${PLAN_SVC[$svc]}" == "0" ]] && continue
+      expanded=""
+      for cpu in ${PLAN_SVC[$svc]//,/ }; do
+        expanded+="${cpu}"$'\n'
+        sib="${HT_SIBLING[$cpu]:-$cpu}"
+        [[ "$sib" != "$cpu" ]] && expanded+="${sib}"$'\n'
+      done
+      PLAN_SVC[$svc]="$(printf '%s' "$expanded" | sort -n -u | paste -sd, -)"
+    done
+  fi
+
   # Tiny-box sanity from doc Case 1 when 4 physical cores & single
   if [[ "$ROLE" == "single" && $n_phys -eq 4 && -z "$PROFILE_FILE" ]]; then
     PLAN_SVC[tools]=0
@@ -611,6 +722,7 @@ plan_allocation() {
     PLAN_SVC[asterisk]=3
     PLAN_SVC[ameyoreports]=2
     PLAN_SVC[ameyoarchiver]=2
+    PLAN_SVC[ameyo_voicelogs_conversion]=2
     # IRQ: eth0, disk1, tel3 — rebuild if auto differed
     if [[ "$HAS_TELEPHONY" == "yes" ]]; then
       for irq in "${IRQ_TEL[@]:-}"; do PLAN_IRQ[$irq]=3; done
@@ -636,10 +748,25 @@ print_plan() {
   if [[ ${#PLAN_IRQ[@]} -eq 0 ]]; then
     echo "  (none discovered)"
   else
-    local irq
-    for irq in $(printf '%s\n' "${!PLAN_IRQ[@]}" | sort -n); do
-      echo "  IRQ $irq -> CPU ${PLAN_IRQ[$irq]}  mask=$(cpu_to_smp_mask "${PLAN_IRQ[$irq]}")"
+    local cls irq cpus count
+    for cls in eth disk telephony; do
+      cpus=""; count=0
+      for irq in "${!PLAN_IRQ[@]}"; do
+        [[ "${PLAN_IRQ_CLASS[$irq]:-}" == "$cls" ]] || continue
+        cpus+="${PLAN_IRQ[$irq]}"$'\n'
+        count=$((count + 1))
+      done
+      [[ $count -eq 0 ]] && continue
+      cpus="$(printf '%s' "$cpus" | sort -n -u | paste -sd, -)"
+      printf '  %-10s %3d queue(s) -> CPU %s\n' "$cls" "$count" "$cpus"
     done
+    if [[ "${AFFINITY_VERBOSE:-0}" == "1" ]]; then
+      for irq in $(printf '%s\n' "${!PLAN_IRQ[@]}" | sort -n); do
+        echo "    IRQ $irq -> CPU ${PLAN_IRQ[$irq]}  mask=$(cpu_to_smp_mask "${PLAN_IRQ[$irq]}")"
+      done
+    else
+      echo "    (set AFFINITY_VERBOSE=1 for per-IRQ detail)"
+    fi
   fi
   echo
   echo "-- Ameyo services --"
