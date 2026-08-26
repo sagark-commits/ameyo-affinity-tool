@@ -206,7 +206,7 @@ run_one() {
     fi
 
     if [[ $VERIFY -eq 1 ]]; then
-      remote_cmd="sudo '${REMOTE_DIR}/affinity_tool.sh' --verify"
+      remote_cmd="sudo '${REMOTE_DIR}/affinity_tool.sh' --verify --role '${role}'"
     elif [[ $DETECT -eq 1 ]]; then
       remote_cmd="sudo '${REMOTE_DIR}/affinity_tool.sh' --detect"
     elif [[ $APPLY -eq 1 ]]; then

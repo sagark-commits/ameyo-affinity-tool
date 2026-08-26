@@ -37,8 +37,8 @@ sudo ./affinity_tool.sh
 # 3) Apply
 sudo ./affinity_tool.sh --role single --apply
 
-# 4) After reboot (grub), verify
-sudo ./affinity_tool.sh --verify
+# 4) After reboot (grub), verify against the same explicit plan
+sudo ./affinity_tool.sh --verify --role single
 ```
 
 ## Roles
@@ -150,6 +150,9 @@ Primary and secondary in each pair get the **same role** so failover affinity ma
 Inventory roles remain explicit and are never replaced by auto detection.
 `--concurrent-calls` and `--active-agents` can be passed through batch runs;
 only services managed by each inventory role use the relevant input.
+Batch verification passes each inventory role and both workload inputs to the
+remote tool, so it regenerates the exact expected plan instead of sampling
+arbitrary live state.
 Production apply requires either `--host` or `--pair`; parallel apply is
 rejected. Pair apply stops immediately if the secondary fails, so the primary
 is not changed after a partial rollout.
@@ -218,6 +221,14 @@ chmod +x affinity_tool.sh affinity_batch.sh install.sh
 - ASAP roles update both `ACP` and `ASAP`
 - DJINN itself is not pinned; it is restarted only after an atomic successful
   config merge, and restart failure fails the host
+- All discovered IRQ writes are attempted. Any rejection fails the host with
+  one aggregate list containing the IRQ, device name/class, and reason.
+- Boot persistence stores CPU pools, not IRQ numbers. At each boot it
+  rediscovers NIC, disk, and telephony IRQs and round-robins current queues over
+  those pools. Systemd runs it after `local-fs.target` and
+  `network-online.target`; failures are visible on
+  `ameyo-affinity-irq.service` in the journal. `rc.local` is only a fallback on
+  systems without systemd.
 - Logs under `/var/tmp/affinity-tool/`
 - Reboot needed once for grub `default_affinity`
 
@@ -230,6 +241,10 @@ or a dry-run first to confirm which existing affinity path is selected.
 After each host, verify:
 
 ```bash
+# Preferred: regenerate and compare the full expected plan. Reuse workload
+# inputs from apply when they were supplied.
+sudo ./affinity_tool.sh --verify --role app --active-agents 300
+
 # Merged file: unrelated rows retained; managed rows use semicolon CPU lists
 sudo grep -E '^(APPSERVER|POSTGRESQL|AMEYOREPORTS|AMEYOARCHIVER|AMEYO_VOICELOGS_CONVERSION|CRM|DAGENT|ASTERISK13|ASAP|ACP),' \
   /dacx/var/ameyo/dacxdata/etc/djinn/serviceCPUAffinityConf.csv
@@ -242,11 +257,22 @@ systemctl is-enabled irqbalance
 # A successful restart command is required. djinn.service may return inactive
 # with MainPID=0 because it is Type=forking and has no persistent DJINN process.
 systemctl status djinn.service
+systemctl status ameyo-affinity-irq.service
+journalctl -u ameyo-affinity-irq.service
 
 # After the planned reboot
 grep -o 'default_affinity=[^ ]*' /proc/cmdline
 cat /proc/irq/default_smp_affinity
 ```
+
+Verification checks every currently discovered planned IRQ, requested and
+effective masks, all managed CSV rows and delimiters, relevant service process
+affinity when a reliable process match exists, `default_affinity`, irqbalance,
+and persistence-unit failure. Missing expected processes are reported as
+`not-running`; they are informational because standby services may legitimately
+be stopped. Actionable mismatches return nonzero. Bare `--verify` remains
+available: it attempts safe role detection and clearly reports when expected
+plan comparison was skipped.
 
 ## Manual checklist (if you only want the plan)
 
