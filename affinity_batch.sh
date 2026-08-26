@@ -313,7 +313,7 @@ if [[ $SELECTED -eq 0 ]]; then
   echo "ERROR: no inventory host matched the requested host or pair"
   exit 1
 fi
-if [[ $APPLY -eq 1 ]]; then
+if [[ $APPLY -eq 1 && $FAIL -eq 0 ]]; then
   echo
   echo "NOTE: grub default_affinity needs a reboot on each host."
   echo "After reboot:  $0 --verify"

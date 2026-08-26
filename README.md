@@ -221,16 +221,40 @@ chmod +x affinity_tool.sh affinity_batch.sh install.sh
 - ASAP roles update both `ACP` and `ASAP`
 - DJINN itself is not pinned; it is restarted only after an atomic successful
   config merge, and restart failure fails the host
-- All discovered IRQ writes are attempted. Any rejection fails the host with
-  one aggregate list containing the IRQ, device name/class, and reason.
+- All discovered IRQ writes are attempted. A rejected write is accepted only
+  when its error is consistent with a kernel-managed IRQ (for example EIO,
+  EINVAL, EBUSY, or EOPNOTSUPP) and its effective/current affinity is a valid,
+  nonempty one-hot CPU mask. Debugfs managed-affinity flags strengthen the
+  evidence when mounted but are not required. These vectors are preserved and
+  reported as `MANAGED/SKIP`; writable control vectors remain pinned normally.
+  Permission denied, read-only/missing paths, malformed masks, unrestricted
+  masks, and all other unexplained errors remain fatal and are aggregated.
 - Boot persistence stores CPU pools, not IRQ numbers. At each boot it
   rediscovers NIC, disk, and telephony IRQs and round-robins current queues over
-  those pools. Systemd runs it after `local-fs.target` and
+  those pools. It records successful/managed outcomes by IRQ class and action
+  name (not IRQ number), so verification remains valid after IRQ renumbering.
+  The persistence unit is installed or enabled only after the immediate IRQ
+  pass contains exclusively applied or validated-managed outcomes. Systemd runs it after `local-fs.target` and
   `network-online.target`; failures are visible on
   `ameyo-affinity-irq.service` in the journal. `rc.local` is only a fallback on
   systems without systemd.
 - Logs under `/var/tmp/affinity-tool/`
 - Reboot needed once for grub `default_affinity`
+
+### Recovering a partial apply
+
+If an older tool stopped after writable vectors were pinned but rejected
+kernel-managed MSI-X vectors, deploy this version and rerun the same explicit
+role with `--apply`; no reboot is required before rerunning. The operation is
+idempotent: it rediscovers current IRQs, reapplies writable vectors, validates
+managed vectors, installs persistence only after that pass succeeds, then
+merges the service CSV/config and restarts DJINN. Reboot afterward only to
+activate a changed grub `default_affinity`.
+
+If the rerun reports a genuine IRQ failure, persistence is not newly enabled,
+the service merge and DJINN restart do not run, and the batch command does not
+advertise reboot. Correct the reported path/permission/format or unexpected
+kernel error and rerun.
 
 ## Pair rollout and verification
 
@@ -266,7 +290,11 @@ cat /proc/irq/default_smp_affinity
 ```
 
 Verification checks every currently discovered planned IRQ, requested and
-effective masks, all managed CSV rows and delimiters, relevant service process
+effective masks, and reports validated kernel-managed vectors distinctly.
+Managed acceptance requires matching persisted class/action evidence from a
+successful apply (surviving IRQ renumbering) or a readable kernel managed flag,
+plus a one-hot live assignment; an arbitrary one-hot mismatch is still a
+failure. Verification also checks all managed CSV rows and delimiters, relevant service process
 affinity when a reliable process match exists, `default_affinity`, irqbalance,
 and persistence-unit failure. Missing expected processes are reported as
 `not-running`; they are informational because standby services may legitimately

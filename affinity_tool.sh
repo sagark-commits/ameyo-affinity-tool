@@ -6,7 +6,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.4.1"
+VERSION="1.5.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${AFFINITY_LOG_DIR:-/var/tmp/affinity-tool}"
 DACX_ROOT="${DACX_ROOT:-/dacx}"
@@ -25,6 +25,7 @@ REBOOT_HINT=0
 TS="$(date +%Y%m%d-%H%M%S)"
 AFFINITY_CONFIG_PATH=""
 AFFINITY_CONFIG_TYPE=""
+MANAGED_STATE_PATH="${AFFINITY_MANAGED_STATE_PATH:-}"
 
 # Runtime state (filled by detect_*)
 OS_FAMILY=""
@@ -1059,6 +1060,7 @@ apply_grub() {
 
 write_irq_script() {
   local out="${AFFINITY_SETTER_OUT:-${DACX_ROOT}/affinitySetter.sh}"
+  local state="${MANAGED_STATE_PATH:-${out}.managed-state}"
   mkdir -p "$DACX_ROOT"
   local tmp
   tmp="$(mktemp)"
@@ -1069,7 +1071,12 @@ write_irq_script() {
     echo "set -uo pipefail"
     echo 'INTERRUPTS="${AFFINITY_PROC_INTERRUPTS:-/proc/interrupts}"'
     echo 'IRQ_ROOT="${AFFINITY_PROC_IRQ_ROOT:-/proc/irq}"'
+    echo 'DEBUG_IRQ_ROOT="${AFFINITY_DEBUG_IRQ_ROOT:-/sys/kernel/debug/irq/irqs}"'
+    printf 'STATE_FILE="${AFFINITY_MANAGED_STATE_PATH:-%s}"\n' "$state"
     echo 'failures=()'
+    echo 'mkdir -p "$(dirname "$STATE_FILE")" || { echo "ERROR: cannot create managed-state directory" >&2; exit 1; }'
+    echo 'state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || exit 1'
+    echo 'trap '"'"'rm -f "$state_tmp"'"'"' EXIT'
     echo 'discover_class() {'
     echo '  local cls=$1 line irq name'
     echo '  while IFS= read -r line; do'
@@ -1082,8 +1089,47 @@ write_irq_script() {
     echo '    esac'
     echo '  done < "$INTERRUPTS"'
     echo '}'
+    echo 'canonical_mask() { local v; v="$(tr -d "[:space:],xX" <<< "$1" | tr "A-F" "a-f")"; v="${v#"${v%%[!0]*}"}"; printf "%s\n" "${v:-0}"; }'
+    echo 'one_hot_cpu() {'
+    echo '  local raw canon py'
+    echo '  raw=$1; canon="$(canonical_mask "$raw")"; [[ "$canon" != 0 ]] || return 1'
+    echo '  py="$(command -v python3 || command -v python || true)"'
+    echo '  if [[ -n "$py" ]]; then "$py" - "$canon" <<'"'"'PY'"'"''
+    echo 'import sys'
+    echo 'try: n=int(sys.argv[1],16)'
+    echo 'except ValueError: raise SystemExit(1)'
+    echo 'if n <= 0 or n & (n-1): raise SystemExit(1)'
+    echo 'print(n.bit_length()-1)'
+    echo 'PY'
+    echo '  else'
+    echo '    [[ ${#canon} -le 8 ]] || return 1; local n=$((16#$canon)) cpu=0'
+    echo '    (( n > 0 && (n & (n-1)) == 0 )) || return 1'
+    echo '    while (( n > 1 )); do n=$((n >> 1)); cpu=$((cpu + 1)); done; echo "$cpu"'
+    echo '  fi'
+    echo '}'
+    echo 'irq_debug_managed() {'
+    echo '  local irq=$1 f text=""'
+    echo '  for f in "$DEBUG_IRQ_ROOT/$irq" "$DEBUG_IRQ_ROOT/$irq/"*; do [[ -r "$f" && ! -d "$f" ]] && text+="$(tr "[:upper:]" "[:lower:]" < "$f" 2>/dev/null || true) "; done'
+    echo '  [[ "$text" == *managed*affinity* || "$text" == *affinity*managed* ]]'
+    echo '}'
+    echo 'managed_rejection() {'
+    echo '  local irq=$1 reason=$2 live cpu'
+    echo '  case "${reason,,}" in'
+    echo '    *"input/output error"*|*"invalid argument"*|*"device or resource busy"*|*"operation not supported"*|*"not supported"*) ;;'
+    echo '    *) return 1 ;;'
+    echo '  esac'
+    echo '  live="$(tr -d " \n" < "$IRQ_ROOT/$irq/effective_affinity" 2>/dev/null || true)"'
+    echo '  [[ -n "$live" ]] || live="$(tr -d " \n" < "$IRQ_ROOT/$irq/smp_affinity" 2>/dev/null || true)"'
+    echo '  cpu="$(one_hot_cpu "$live" 2>/dev/null)" || return 1'
+    echo '  MANAGED_CPU="$cpu"; MANAGED_MASK="$(canonical_mask "$live")"'
+    echo '  return 0'
+    echo '}'
+    echo 'write_affinity() {'
+    echo '  local path=$1 mask=$2'
+    echo '  if [[ -n "${AFFINITY_IRQ_WRITE_HELPER:-}" ]]; then "$AFFINITY_IRQ_WRITE_HELPER" "$path" "$mask"; else printf "%s\n" "$mask" > "$path"; fi'
+    echo '}'
     echo 'apply_class() {'
-    echo '  local cls=$1 pool_csv=$2 idx=0 item irq name cpu mask path reason'
+    echo '  local cls=$1 pool_csv=$2 idx=0 item irq name cpu mask path reason flags'
     echo '  local -a pool=(); IFS=, read -ra pool <<< "$pool_csv"'
     echo '  [[ ${#pool[@]} -gt 0 && -n "${pool[0]}" ]] || return 0'
     echo '  while IFS= read -r item; do'
@@ -1092,8 +1138,18 @@ write_irq_script() {
     echo '    path="$IRQ_ROOT/$irq/smp_affinity"'
     echo '    if ! mask="$(mask_for_cpu "$cpu" 2>&1)"; then reason="$mask"'
     echo '    elif [[ ! -e "$path" ]]; then reason="affinity path missing"'
-    echo '    elif ! reason="$(printf "%s\n" "$mask" > "$path" 2>&1)"; then reason="${reason:-write rejected}"'
-    echo '    else echo "IRQ $irq ($name/$cls) -> CPU $cpu"; continue; fi'
+    echo '    elif ! reason="$(write_affinity "$path" "$mask" 2>&1)"; then'
+    echo '      reason="${reason:-write rejected without errno text}"'
+    echo '      if managed_rejection "$irq" "$reason"; then'
+    echo '        flags=""; irq_debug_managed "$irq" && flags=" debugfs-managed"'
+    echo '        printf "%s\t%s\tmanaged\t%s\t%s\n" "$cls" "$name" "$MANAGED_CPU" "$MANAGED_MASK" >> "$state_tmp"'
+    echo '        echo "MANAGED/SKIP IRQ $irq ($name/$cls) -> effective CPU $MANAGED_CPU; write rejected: $reason${flags}"'
+    echo '        continue'
+    echo '      fi'
+    echo '    else'
+    echo '      printf "%s\t%s\tapplied\t%s\t%s\n" "$cls" "$name" "$cpu" "$(canonical_mask "$mask")" >> "$state_tmp"'
+    echo '      echo "APPLIED IRQ $irq ($name/$cls) -> CPU $cpu"; continue'
+    echo '    fi'
     echo '    failures+=("IRQ $irq ($name/$cls): $reason")'
     echo '  done < <(discover_class "$cls")'
     echo '  [[ $idx -gt 0 ]] || failures+=("IRQ discovery ($cls): no matching IRQs found after boot ordering")'
@@ -1127,12 +1183,15 @@ write_irq_script() {
     echo '  printf "  - %s\n" "${failures[@]}" >&2'
     echo '  exit 1'
     echo 'fi'
+    echo 'mv -f "$state_tmp" "$STATE_FILE" || { echo "ERROR: cannot persist managed IRQ evidence: $STATE_FILE" >&2; exit 1; }'
+    echo 'trap - EXIT'
   } > "$tmp"
   if [[ $APPLY -eq 1 ]]; then
     cp -a "$tmp" "$out"
     chmod 755 "$out"
     local irq_rc=0
     bash "$out" || irq_rc=$?
+    [[ $irq_rc -eq 0 ]] || { rm -f "$tmp"; die "IRQ affinity apply failed; persistence was not installed"; }
     # Prefer systemd: device IRQs are rediscovered after filesystems and network.
     if [[ "${AFFINITY_SKIP_PERSISTENCE:-0}" == "1" ]]; then
       log "Test mode: skipped boot persistence"
@@ -1171,7 +1230,6 @@ EOF
     else
       die "No supported boot persistence mechanism (systemd or rc.local)"
     fi
-    [[ $irq_rc -eq 0 ]] || die "IRQ affinity apply failed; see aggregate IRQ/name/reason report above"
   else
     log "DRY-RUN: would write $out"
     cat "$tmp" >&2
@@ -1370,6 +1428,8 @@ verify_state() {
   local proc_cmdline="${AFFINITY_PROC_CMDLINE:-/proc/cmdline}"
   local proc_interrupts="${AFFINITY_PROC_INTERRUPTS:-/proc/interrupts}"
   local proc_irq_root="${AFFINITY_PROC_IRQ_ROOT:-/proc/irq}"
+  local debug_irq_root="${AFFINITY_DEBUG_IRQ_ROOT:-/sys/kernel/debug/irq/irqs}"
+  local managed_state="${AFFINITY_MANAGED_STATE_PATH:-${DACX_ROOT}/affinitySetter.sh.managed-state}"
   echo "========== VERIFY =========="
   if discover_affinity_config; then
     echo "OK  affinity config: $AFFINITY_CONFIG_PATH"
@@ -1415,13 +1475,37 @@ verify_state() {
   fi
 
   echo "-- Expected IRQ affinities --"
-  local irq expected actual effective name
+  local irq expected actual effective name state_outcome state_cpu state_mask flags
   for irq in $(printf '%s\n' "${!PLAN_IRQ[@]}" | sort -n); do
     expected="$(cpu_to_smp_mask "${PLAN_IRQ[$irq]}")"
     actual="$(tr -d ' \n,' < "$proc_irq_root/$irq/smp_affinity" 2>/dev/null || true)"
     effective="$(tr -d ' \n,' < "$proc_irq_root/$irq/effective_affinity" 2>/dev/null || true)"
     expected="${expected//,/}"; name="$(grep -E "^[[:space:]]*${irq}:" "$proc_interrupts" 2>/dev/null | awk '{print $NF}' || true)"
-    if [[ -z "$actual" ]]; then
+    state_outcome=""; state_cpu=""; state_mask=""
+    if [[ -r "$managed_state" && -n "$name" ]]; then
+      IFS=$'\t' read -r state_outcome state_cpu state_mask < <(
+        awk -F '\t' -v c="${PLAN_IRQ_CLASS[$irq]:-}" -v n="$name" '$1==c && $2==n {print $3 "\t" $4 "\t" $5; exit}' "$managed_state"
+      )
+    fi
+    flags=""
+    if [[ -e "$debug_irq_root/$irq" ]] && grep -RiqE 'managed.*affinity|affinity.*managed' "$debug_irq_root/$irq" 2>/dev/null; then flags="kernel-flag"; fi
+    if [[ "$state_outcome" == managed ]]; then
+      local live_cpu=""
+      live_cpu="$(one_hot_mask_cpu "${effective:-$actual}" 2>/dev/null || true)"
+      if [[ -n "$live_cpu" ]]; then
+        echo "MANAGED/SKIP IRQ $irq ($name/${PLAN_IRQ_CLASS[$irq]:-}) -> effective CPU $live_cpu (persisted apply evidence${flags:+, $flags})"
+        continue
+      fi
+      echo "FAIL IRQ $irq ($name) persisted managed evidence but live affinity is not one-hot"; verify_rc=1
+    elif [[ -n "$flags" ]]; then
+      local live_cpu=""
+      live_cpu="$(one_hot_mask_cpu "${effective:-$actual}" 2>/dev/null || true)"
+      if [[ -n "$live_cpu" ]]; then
+        echo "MANAGED/SKIP IRQ $irq ($name/${PLAN_IRQ_CLASS[$irq]:-}) -> effective CPU $live_cpu ($flags)"
+        continue
+      fi
+      echo "FAIL IRQ $irq ($name) kernel-managed flag present but live affinity is not one-hot"; verify_rc=1
+    elif [[ -z "$actual" ]]; then
       echo "FAIL IRQ $irq ($name) affinity unreadable"; verify_rc=1
     elif [[ "${actual,,}" != "${expected,,}" ]]; then
       echo "FAIL IRQ $irq ($name) expected CPU ${PLAN_IRQ[$irq]} mask=$expected actual=$actual"; verify_rc=1
@@ -1486,6 +1570,20 @@ verify_state() {
   done
   echo "============================"
   return "$verify_rc"
+}
+
+one_hot_mask_cpu() {
+  local value="${1//,/}" py
+  value="${value//[[:space:]]/}"
+  [[ "$value" =~ ^[0-9a-fA-F]+$ ]] || return 1
+  py="$(command -v python3 || command -v python || true)"
+  [[ -n "$py" ]] || return 1
+  "$py" - "$value" <<'PY'
+import sys
+n=int(sys.argv[1],16)
+if n <= 0 or n & (n-1): raise SystemExit(1)
+print(n.bit_length()-1)
+PY
 }
 
 print_detect() {
