@@ -8,10 +8,44 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INVENTORY="${SCRIPT_DIR}/inventory/blr-servers.csv"
 SSH_USER="${SSH_USER:-root}"
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -o LogLevel=ERROR)
+SSH_RETRIES="${SSH_RETRIES:-3}"
+SSH_RETRY_WAIT="${SSH_RETRY_WAIT:-8}"
+SSH_MUX_DIR="${TMPDIR:-/tmp}/affinity-mux-$$"
+
+# Multiplex every session for a host over one TCP connection. Without this the
+# deploy opens five connections per host in a burst, which trips SSH rate
+# limiting (fail2ban / firewalld / iptables recent) and the next SYN is dropped.
+SSH_OPTS=(
+  -o StrictHostKeyChecking=accept-new
+  -o ConnectTimeout=15
+  -o BatchMode=yes
+  -o LogLevel=ERROR
+  -o ControlMaster=auto
+  -o "ControlPath=${SSH_MUX_DIR}/%r@%h:%p"
+  -o ControlPersist=120
+)
 # -n keeps ssh from consuming the inventory on stdin (it would eat the CSV loop).
 # No -q here: it would also swallow the reason a connection failed.
 SSH_RUN=(ssh -n "${SSH_OPTS[@]}")
+
+mkdir -p "$SSH_MUX_DIR"
+chmod 700 "$SSH_MUX_DIR"
+cleanup_mux() { rm -rf "$SSH_MUX_DIR" 2>/dev/null || true; }
+trap cleanup_mux EXIT
+
+# Retry the first contact: a dropped SYN from rate limiting clears on its own.
+ssh_connect_retry() {
+  local target="$1" cmd="$2" attempt=1 rc=0
+  while :; do
+    rc=0
+    "${SSH_RUN[@]}" "$target" "$cmd" || rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    [[ $attempt -ge $SSH_RETRIES ]] && return "$rc"
+    echo "  attempt ${attempt}/${SSH_RETRIES} failed (exit ${rc}); retrying in ${SSH_RETRY_WAIT}s"
+    sleep "$SSH_RETRY_WAIT"
+    attempt=$((attempt + 1))
+  done
+}
 REMOTE_DIR="/opt/ameyo-affinity-tool"
 APPLY=0
 VERIFY=0
@@ -95,12 +129,14 @@ run_one() {
     echo "[$(date '+%F %T')] deploy tool -> ${SSH_USER}@${ip}:${REMOTE_DIR}"
 
     local ssh_rc=0
-    "${SSH_RUN[@]}" "${SSH_USER}@${ip}" "mkdir -p '${REMOTE_DIR}/profiles'" || ssh_rc=$?
+    ssh_connect_retry "${SSH_USER}@${ip}" "mkdir -p '${REMOTE_DIR}/profiles'" || ssh_rc=$?
     if [[ $ssh_rc -ne 0 ]]; then
       echo "SSH FAILED (exit ${ssh_rc}): $host ($ip)"
       echo "Reproduce with: ssh -v ${SSH_USER}@${ip} \"mkdir -p '${REMOTE_DIR}/profiles'\""
       case "$ssh_rc" in
-        255) echo "Hint: exit 255 is an ssh transport/auth error (key, host key, or unreachable)." ;;
+        255) echo "Hint: exit 255 is an ssh transport error. 'Connection timed out' with a" \
+                  "host that answers manually usually means SSH rate limiting (fail2ban," \
+                  "firewalld, or iptables recent) dropped the SYN." ;;
         1)   echo "Hint: connected, but the remote command failed (permissions or read-only /opt?)." ;;
       esac
       return 1
