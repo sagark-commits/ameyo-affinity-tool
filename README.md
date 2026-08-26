@@ -42,12 +42,54 @@ sudo ./affinity_tool.sh --verify
 |------|----------|
 | `single` | APP + DB + ACP + Asterisk on one server |
 | `appdb` | APP + DB + ACP (no Asterisk) |
+| `app` | Dedicated APP server |
+| `db` | Dedicated DB (Postgres) |
+| `report` | Dedicated reports / archiver / voicelogs |
+| `asap` | Dedicated ASAP / ACP |
 | `call` | Call server (Asterisk ± telephony) |
 | `custom` | Your own `profiles/*.conf` |
 
 On **exactly 4 physical cores** + `single`, the plan matches the Ameyo doc Case 1 (tools/dagent=0, db=1, server/acp=2, asterisk=3).
 
 On larger boxes it auto-scales: more cores → Postgres gets ~40% of free pool, app next, Asterisk 1–2 cores (tied to telephony IRQ when present).
+
+## Batch all servers (primary + secondary)
+
+Use `affinity_batch.sh` from a jump host that has SSH key access to every node.
+
+BLR inventory is already mapped:
+
+| Pair | Hosts | Role |
+|------|-------|------|
+| APP | BLR-PAPP / BLR-SAPP | `app` |
+| DB | BLR-PDB / BLR-SDB | `db` |
+| REPORT | BLR-PREPORT / BLR-SREPORT | `report` |
+| CS | BLR-PCS / BLR-SCS | `call` |
+| ASAP | BLR-PASAP / BLR-SASAP | `asap` |
+
+```bash
+# On jump host (copy this repo first)
+chmod +x affinity_tool.sh affinity_batch.sh install.sh
+
+# 1) Plan all 10 (no changes)
+./affinity_batch.sh --inventory inventory/blr-servers.csv
+
+# 2) Apply all 10
+./affinity_batch.sh --apply
+
+# 3) One host only
+./affinity_batch.sh --host BLR-PCS --apply
+
+# 4) After reboot — verify all
+./affinity_batch.sh --verify
+
+# Faster (parallel SSH)
+./affinity_batch.sh --apply --parallel
+```
+
+SSH user defaults to `root`. Override with `--user ameyo` or `SSH_USER=ameyo`.
+
+Primary and secondary in each pair get the **same role** so failover affinity matches.
 
 ## OS support
 
@@ -86,6 +128,19 @@ sudo ln -sf /opt/ameyo-affinity-tool/affinity_tool.sh /usr/local/sbin/affinity-t
 # then from any server:
 sudo affinity-tool --role call --apply
 ```
+
+## Troubleshooting
+
+**`/usr/bin/env: 'bash\r': No such file or directory`**
+
+The files were copied with Windows line endings. Fix on the server:
+
+```bash
+sed -i 's/\r$//' affinity_tool.sh affinity_batch.sh install.sh profiles/*.conf inventory/*.csv
+chmod +x affinity_tool.sh affinity_batch.sh install.sh
+```
+
+(Repo now ships `.gitattributes` forcing LF, so fresh clones are fine. Avoid copy-pasting through Windows editors.)
 
 ## Safety
 

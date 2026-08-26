@@ -6,7 +6,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${AFFINITY_LOG_DIR:-/var/tmp/affinity-tool}"
 DACX_ROOT="${DACX_ROOT:-/dacx}"
@@ -52,7 +52,11 @@ USAGE:
 ROLES:
   single      Single server (APP+DB+ACP+Asterisk [+telephony])
   appdb       APP + DB + ACP (no Asterisk)
-  call        Call server (Asterisk [+telephony], no APP/DB)
+  app         Dedicated APP server (APPSERVER)
+  db          Dedicated DB server (Postgres)
+  report      Dedicated reports/archiver/voicelogs
+  asap        Dedicated ASAP/ACP server
+  call        Call server (Asterisk [+telephony])
   custom      Load --profile FILE
 
 OPTIONS:
@@ -74,11 +78,18 @@ EXAMPLES:
   # Apply on a Rocky call server
   sudo ./affinity_tool.sh --role call --apply
 
+  # Dedicated DB / APP / report / ASAP
+  sudo ./affinity_tool.sh --role db --apply
+  sudo ./affinity_tool.sh --role app --apply
+
   # Custom layout
   sudo ./affinity_tool.sh --role custom --profile ./profiles/custom.conf --apply
 
   # Inventory any box
   sudo ./affinity_tool.sh --detect
+
+  # All hosts at once (from jump box):
+  ./affinity_batch.sh --inventory inventory/blr-servers.csv
 EOF
 }
 
@@ -103,9 +114,9 @@ parse_args() {
     esac
   done
   if [[ $VERIFY_ONLY -eq 0 && "$ROLE" != "detect" ]]; then
-    [[ -n "$ROLE" ]] || die "--role is required (single|appdb|call|custom)"
+    [[ -n "$ROLE" ]] || die "--role is required (single|appdb|app|db|report|asap|call|custom)"
     case "$ROLE" in
-      single|appdb|call|custom|detect) ;;
+      single|appdb|app|db|report|asap|call|custom|detect) ;;
       *) die "Invalid role: $ROLE" ;;
     esac
     if [[ "$ROLE" == "custom" && -z "$PROFILE_FILE" ]]; then
@@ -535,6 +546,36 @@ plan_allocation() {
         pool=()
       fi
       PLAN_SVC[asterisk]="$(printf '%s\n' "${ast_cores[@]}" | sort -nu | paste -sd, -)"
+      ;;
+    app)
+      # Dedicated APP: most free cores to APPSERVER
+      local srv_cores=("${pool[@]}")
+      pool=()
+      [[ ${#srv_cores[@]} -eq 0 ]] && srv_cores=(1)
+      PLAN_SVC[server]="$(IFS=,; echo "${srv_cores[*]}")"
+      ;;
+    db)
+      # Dedicated DB: almost all free cores to Postgres
+      local db_cores=("${pool[@]}")
+      pool=()
+      [[ ${#db_cores[@]} -eq 0 ]] && db_cores=(1)
+      PLAN_SVC[database]="$(IFS=,; echo "${db_cores[*]}")"
+      ;;
+    report)
+      local rep_cores=("${pool[@]}")
+      pool=()
+      [[ ${#rep_cores[@]} -eq 0 ]] && rep_cores=(1)
+      local rep_str
+      rep_str="$(IFS=,; echo "${rep_cores[*]}")"
+      PLAN_SVC[ameyoreports]="$rep_str"
+      PLAN_SVC[ameyoarchiver]="$rep_str"
+      PLAN_SVC[ameyo_voicelogs_conversion]="$rep_str"
+      ;;
+    asap)
+      local asap_cores=("${pool[@]}")
+      pool=()
+      [[ ${#asap_cores[@]} -eq 0 ]] && asap_cores=(1)
+      PLAN_SVC[acp]="$(IFS=,; echo "${asap_cores[*]}")"
       ;;
     custom)
       local k

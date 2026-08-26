@@ -1,0 +1,18 @@
+# BLR Ameyo cluster inventory for affinity_batch.sh
+# Columns: hostname,ip,role,pair,notes
+# Roles: app | db | report | call | asap
+# Primary/secondary pairs must use the SAME role (failover-safe).
+#
+# MGMT IPs are listed in notes; batch uses the service IP (ip column).
+
+hostname,ip,role,pair,notes
+BLR-PAPP,10.120.0.121,app,APP,mgmt=10.120.0.131 serial=JF00031N
+BLR-SAPP,10.120.0.122,app,APP,mgmt=10.120.0.132 serial=JF00031P
+BLR-PDB,10.120.0.123,db,DB,mgmt=10.120.0.133 serial=JF00031H
+BLR-SDB,10.120.0.124,db,DB,mgmt=10.120.0.134 serial=JF00030T
+BLR-PREPORT,10.120.0.125,report,REPORT,mgmt=10.120.0.135 serial=JF00030R
+BLR-SREPORT,10.120.0.126,report,REPORT,mgmt=10.120.0.136 serial=JF00031K
+BLR-PCS,10.120.0.127,call,CS,mgmt=10.120.0.137 serial=JF000320
+BLR-SCS,10.120.0.128,call,CS,mgmt=10.120.0.138 serial=JF000321
+BLR-PASAP,10.120.0.129,asap,ASAP,mgmt=10.120.0.139 serial=JF000322
+BLR-SASAP,10.120.0.130,asap,ASAP,mgmt=10.120.0.140 serial=JF000323
