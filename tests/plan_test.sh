@@ -68,13 +68,14 @@ run_case() {
   echo
 }
 
-# BLR fleet shapes (16 physical cores, HT on, 40 NIC + 40 disk queues)
-run_case "BLR-PAPP"   app    16 1 40 40 0
-run_case "BLR-PDB"    db     16 1 40 40 0
-run_case "BLR-PREPORT" report 16 1 40 40 0
-run_case "BLR-PASAP"  asap   16 1 40 40 0
-run_case "BLR-PCS"    call   16 1 40 40 0
-run_case "BLR-PCS+card" call 16 1 40 40 4
+# BLR fleet, verified against lscpu on each host (HT on, single socket)
+# APP/DB/REPORT are 16c/32t; CS/ASAP are 8c/16t
+run_case "BLR-P|SAPP"    app    16 1 40 40 0
+run_case "BLR-P|SDB"     db     16 1 40 40 0
+run_case "BLR-P|SREPORT" report 16 1 40 40 0
+run_case "BLR-P|SCS"     call    8 1 40 40 0
+run_case "BLR-P|SCS+card" call   8 1 40 40 4
+run_case "BLR-P|SASAP"   asap    8 1 40 40 0
 
 # Small/legacy shapes
 run_case "4-core single" single 4 0 1 1 1
