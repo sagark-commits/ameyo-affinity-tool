@@ -9,8 +9,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INVENTORY="${SCRIPT_DIR}/inventory/blr-servers.csv"
 SSH_USER="${SSH_USER:-root}"
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -o LogLevel=ERROR)
-# -n keeps ssh from consuming the inventory on stdin (it would eat the CSV loop)
-SSH_RUN=(ssh -n -q "${SSH_OPTS[@]}")
+# -n keeps ssh from consuming the inventory on stdin (it would eat the CSV loop).
+# No -q here: it would also swallow the reason a connection failed.
+SSH_RUN=(ssh -n "${SSH_OPTS[@]}")
 REMOTE_DIR="/opt/ameyo-affinity-tool"
 APPLY=0
 VERIFY=0
@@ -93,8 +94,17 @@ run_one() {
     echo "---- $host ($ip) role=$role pair=$pair ----"
     echo "[$(date '+%F %T')] deploy tool -> ${SSH_USER}@${ip}:${REMOTE_DIR}"
 
-    "${SSH_RUN[@]}" "${SSH_USER}@${ip}" "mkdir -p '${REMOTE_DIR}/profiles'" \
-      || { echo "SSH FAILED: $host ($ip)"; return 1; }
+    local ssh_rc=0
+    "${SSH_RUN[@]}" "${SSH_USER}@${ip}" "mkdir -p '${REMOTE_DIR}/profiles'" || ssh_rc=$?
+    if [[ $ssh_rc -ne 0 ]]; then
+      echo "SSH FAILED (exit ${ssh_rc}): $host ($ip)"
+      echo "Reproduce with: ssh -v ${SSH_USER}@${ip} \"mkdir -p '${REMOTE_DIR}/profiles'\""
+      case "$ssh_rc" in
+        255) echo "Hint: exit 255 is an ssh transport/auth error (key, host key, or unreachable)." ;;
+        1)   echo "Hint: connected, but the remote command failed (permissions or read-only /opt?)." ;;
+      esac
+      return 1
+    fi
 
     scp -q "${SSH_OPTS[@]}" \
       "${SCRIPT_DIR}/affinity_tool.sh" \
