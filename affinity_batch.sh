@@ -52,6 +52,9 @@ VERIFY=0
 DETECT=0
 PARALLEL=0
 LIMIT_HOST=""
+LIMIT_PAIR=""
+CONCURRENT_CALLS=""
+ACTIVE_AGENTS=""
 TS="$(date +%Y%m%d-%H%M%S)"
 LOG_DIR="${SCRIPT_DIR}/batch-logs/${TS}"
 
@@ -70,14 +73,17 @@ OPTIONS:
   --detect           Only run --detect on each host
   --parallel         Run hosts in parallel (faster; logs per host)
   --host NAME|IP     Limit to one hostname or IP from inventory
+  --pair NAME        Limit to one failover pair; apply secondary then primary
+  --concurrent-calls N  Pass call workload to selected inventory hosts
+  --active-agents N     Pass CRM workload to selected inventory hosts
   -h, --help         Help
 
 EXAMPLES:
   # Plan all 10 BLR servers (safe)
   ./affinity_batch.sh
 
-  # Apply everywhere
-  ./affinity_batch.sh --apply
+  # Apply one failover pair, secondary then primary
+  ./affinity_batch.sh --pair APP --apply
 
   # One host only
   ./affinity_batch.sh --host BLR-PCS --apply
@@ -98,13 +104,52 @@ while [[ $# -gt 0 ]]; do
     --detect) DETECT=1; shift ;;
     --parallel) PARALLEL=1; shift ;;
     --host) LIMIT_HOST="${2:-}"; shift 2 ;;
+    --pair) LIMIT_PAIR="${2:-}"; shift 2 ;;
+    --concurrent-calls) CONCURRENT_CALLS="${2:-}"; shift 2 ;;
+    --active-agents) ACTIVE_AGENTS="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1"; usage; exit 1 ;;
   esac
 done
 
 [[ -f "$INVENTORY" ]] || { echo "Inventory not found: $INVENTORY"; exit 1; }
+if [[ -n "$CONCURRENT_CALLS" && ! "$CONCURRENT_CALLS" =~ ^[0-9]+$ ]]; then
+  echo "--concurrent-calls must be a non-negative integer"
+  exit 1
+fi
+if [[ -n "$ACTIVE_AGENTS" && ! "$ACTIVE_AGENTS" =~ ^[0-9]+$ ]]; then
+  echo "--active-agents must be a non-negative integer"
+  exit 1
+fi
+if [[ -n "$LIMIT_HOST" && -n "$LIMIT_PAIR" ]]; then
+  echo "Use only one of --host or --pair"
+  exit 1
+fi
+if [[ $APPLY -eq 1 && -z "$LIMIT_HOST" && -z "$LIMIT_PAIR" ]]; then
+  echo "Production apply is limited to one host or pair. Use --host NAME or --pair NAME."
+  exit 1
+fi
+if [[ $APPLY -eq 1 && $PARALLEL -eq 1 ]]; then
+  echo "Parallel apply is disabled; pair rollout must be secondary-first with verification."
+  exit 1
+fi
 mkdir -p "$LOG_DIR"
+
+# Pair application is deliberately serialized secondary-first. The second pass
+# contains the primary (and any nonstandard member names) only after secondary
+# has returned success.
+if [[ $APPLY -eq 1 && -n "$LIMIT_PAIR" ]]; then
+  ORDERED_INVENTORY="${LOG_DIR}/.pair-order.csv"
+  awk -F, -v wanted="$LIMIT_PAIR" '
+    BEGIN { IGNORECASE=1 }
+    $4 == wanted && $1 ~ /(^|[-_])S/ { print }
+  ' "$INVENTORY" > "$ORDERED_INVENTORY"
+  awk -F, -v wanted="$LIMIT_PAIR" '
+    BEGIN { IGNORECASE=1 }
+    $4 == wanted && $1 !~ /(^|[-_])S/ { print }
+  ' "$INVENTORY" >> "$ORDERED_INVENTORY"
+  INVENTORY="$ORDERED_INVENTORY"
+fi
 
 MODE="DRY-RUN"
 [[ $APPLY -eq 1 ]] && MODE="APPLY"
@@ -142,9 +187,12 @@ run_one() {
       return 1
     fi
 
-    scp -q "${SSH_OPTS[@]}" \
+    if ! scp -q "${SSH_OPTS[@]}" \
       "${SCRIPT_DIR}/affinity_tool.sh" \
-      "${SSH_USER}@${ip}:${REMOTE_DIR}/affinity_tool.sh" >/dev/null
+      "${SSH_USER}@${ip}:${REMOTE_DIR}/affinity_tool.sh" >/dev/null; then
+      echo "DEPLOY FAILED: could not copy affinity_tool.sh to $host"
+      return 1
+    fi
 
     # profiles optional; newer scp (SFTP mode) rejects a bare "." source
     if compgen -G "${SCRIPT_DIR}/profiles/*" >/dev/null 2>&1; then
@@ -152,7 +200,10 @@ run_one() {
         "${SSH_USER}@${ip}:${REMOTE_DIR}/profiles/" >/dev/null || true
     fi
 
-    "${SSH_RUN[@]}" "${SSH_USER}@${ip}" "chmod +x '${REMOTE_DIR}/affinity_tool.sh'"
+    if ! "${SSH_RUN[@]}" "${SSH_USER}@${ip}" "chmod +x '${REMOTE_DIR}/affinity_tool.sh'"; then
+      echo "DEPLOY FAILED: could not make remote tool executable on $host"
+      return 1
+    fi
 
     if [[ $VERIFY -eq 1 ]]; then
       remote_cmd="sudo '${REMOTE_DIR}/affinity_tool.sh' --verify"
@@ -163,6 +214,8 @@ run_one() {
     else
       remote_cmd="sudo '${REMOTE_DIR}/affinity_tool.sh' --role '${role}'"
     fi
+    [[ -n "$CONCURRENT_CALLS" ]] && remote_cmd+=" --concurrent-calls '${CONCURRENT_CALLS}'"
+    [[ -n "$ACTIVE_AGENTS" ]] && remote_cmd+=" --active-agents '${ACTIVE_AGENTS}'"
 
     # If already root, drop sudo
     if [[ "$SSH_USER" == "root" ]]; then
@@ -182,6 +235,7 @@ declare -a HOSTS=()
 FAIL=0
 OK=0
 SKIP=0
+SELECTED=0
 
 while IFS= read -r line <&3 || [[ -n "$line" ]]; do
   line="${line%$'\r'}"
@@ -202,6 +256,9 @@ while IFS= read -r line <&3 || [[ -n "$line" ]]; do
       continue
     fi
   fi
+  if [[ -n "$LIMIT_PAIR" && "${pair^^}" != "${LIMIT_PAIR^^}" ]]; then
+    continue
+  fi
 
   case "$role" in
     single|appdb|app|db|report|asap|call|custom) ;;
@@ -213,6 +270,7 @@ while IFS= read -r line <&3 || [[ -n "$line" ]]; do
   esac
 
   HOSTS+=("$hostname")
+  SELECTED=$((SELECTED + 1))
   echo "Queue: $hostname  $ip  role=$role  pair=$pair"
 
   if [[ $PARALLEL -eq 1 ]]; then
@@ -225,6 +283,10 @@ while IFS= read -r line <&3 || [[ -n "$line" ]]; do
     else
       echo "FAIL $hostname  (log: ${LOG_DIR}/${hostname}.log)"
       FAIL=$((FAIL + 1))
+      if [[ $APPLY -eq 1 && -n "$LIMIT_PAIR" ]]; then
+        echo "STOP pair $LIMIT_PAIR: not continuing after $hostname failure"
+        break
+      fi
     fi
   fi
 done 3< "$INVENTORY"
@@ -247,6 +309,10 @@ echo
 echo "=== SUMMARY ==="
 echo "OK=$OK  FAIL=$FAIL  SKIP=$SKIP"
 echo "Logs: $LOG_DIR"
+if [[ $SELECTED -eq 0 ]]; then
+  echo "ERROR: no inventory host matched the requested host or pair"
+  exit 1
+fi
 if [[ $APPLY -eq 1 ]]; then
   echo
   echo "NOTE: grub default_affinity needs a reboot on each host."

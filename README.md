@@ -7,13 +7,15 @@ Dry-run by default. Safe to run with `--detect` on any box.
 ## What it does
 
 1. Detects OS + grub style (legacy CentOS6 `grub.conf` vs grub2 / Rocky / RHEL)
-2. Builds CPU map from `/proc/cpuinfo` (no `cpuspecification.py` required; HT-aware)
+2. Builds CPU map from sysfs (with `/proc/cpuinfo` fallback), grouping arbitrary
+   package/core IDs and HT sibling layouts
 3. Finds IRQs for ethernet / disk / telephony
-4. Plans core layout from **role** (scales with CPU count)
+4. Detects a safe role when requested and plans a workload-aware layout
 5. Optionally applies:
    - grub `default_affinity`
    - `/dacx/affinitySetter.sh` + boot persistence
-   - Ameyo `serviceCPUAffinityConf.csv` or `affinity.cfg`
+   - Merges role-specific rows into Ameyo `serviceCPUAffinityConf.csv` or
+     `affinity.cfg` while preserving unrelated service rows
    - disables `irqbalance`
 
 ## Quick start (on the Linux server)
@@ -28,6 +30,9 @@ sudo ./affinity_tool.sh --detect
 
 # 2) Plan only (no changes)
 sudo ./affinity_tool.sh --role single          # or: appdb | call
+
+# Or safely infer the role from active services (hostname is only a fallback)
+sudo ./affinity_tool.sh
 
 # 3) Apply
 sudo ./affinity_tool.sh --role single --apply
@@ -48,10 +53,62 @@ sudo ./affinity_tool.sh --verify
 | `asap` | Dedicated ASAP / ACP |
 | `call` | Call server (Asterisk ± telephony) |
 | `custom` | Your own `profiles/*.conf` |
+| `auto` | Infer from unambiguous active-service evidence, then hostname hints |
 
 On **exactly 4 physical cores** + `single`, the plan matches the Ameyo doc Case 1 (tools/dagent=0, db=1, server/acp=2, asterisk=3).
 
-On larger boxes it auto-scales: more cores → Postgres gets ~40% of free pool, app next, Asterisk 1–2 cores (tied to telephony IRQ when present).
+Dedicated APP, DB, REPORT, ASAP, and ACP workloads use their full post-system/
+IRQ service pool. CRM and DAGENT use computed subsets of that same pool. These
+sets intentionally overlap: they are allowed CPU sets, not exclusive
+partitions. ASTERISK13 is managed only by the `call` role; the older `ASTERISK`
+row is left untouched.
+
+## Intelligent sizing
+
+All counts below are **physical service cores**. On HT systems the selected
+core's logical siblings are added to service CPU lists; IRQs stay on primary
+threads. Every result is clamped to the available service pool.
+
+- DAGENT: `ceil(service_cores × 15%)`, minimum 2, maximum 3. A one-core
+  service pool necessarily clamps to one.
+- CRM without `--active-agents`: `ceil(service_cores × 35%)`, minimum 2,
+  maximum 5. This normally gives 4–5 cores on a 16-physical-core host after
+  system/IRQ reservations.
+- CRM with `--active-agents N`: `ceil(N / 75)`, minimum 2, maximum 5.
+- ASTERISK13: `ceil(concurrent_calls / 100)`, minimum 2. If
+  `--concurrent-calls` is omitted, the safe default is 500 calls (five cores
+  when available); there is no fixed maximum beyond the service pool.
+- APP/APPSERVER, DB/POSTGRESQL, report services, ASAP, and ACP: full service
+  pool.
+
+Examples:
+
+```bash
+# 800 calls -> 8 physical ASTERISK13 cores, or all available if fewer
+sudo ./affinity_tool.sh --role call --concurrent-calls 800
+
+# 300 active agents -> 4 CRM cores; APPSERVER still gets the full pool
+sudo ./affinity_tool.sh --role app --active-agents 300
+
+# Omitted inputs print the defaults and exact calculation in the plan
+sudo ./affinity_tool.sh --role report
+```
+
+## Safe automatic role detection
+
+Omitting `--role`, or using `--role auto`, applies this priority:
+
+1. An explicit non-auto `--role` always wins.
+2. Unambiguous active process/systemd evidence selects `single`, `appdb`,
+   `app`, `db`, `report`, `asap`, or `call`.
+3. If there is no active-service match, conservative hostname forms such as
+   `PAPP/SAPP`, `PDB/SDB`, `PREPORT/SREPORT`, `PCS/SCS`, and `PASAP/SASAP`
+   may select a role.
+
+The installed service affinity CSV is never role evidence because generic
+installs commonly list every service. If evidence is absent or conflicting, a
+dry-run explains the candidates and stops without a plan. `--apply` fails
+closed and asks for an explicit role.
 
 ## Batch all servers (primary + secondary)
 
@@ -74,22 +131,28 @@ chmod +x affinity_tool.sh affinity_batch.sh install.sh
 # 1) Plan all 10 (no changes)
 ./affinity_batch.sh --inventory inventory/blr-servers.csv
 
-# 2) Apply all 10
-./affinity_batch.sh --apply
+# 2) Apply one pair at a time (secondary first, then primary)
+./affinity_batch.sh --pair APP --apply
 
 # 3) One host only
-./affinity_batch.sh --host BLR-PCS --apply
+./affinity_batch.sh --host BLR-PCS --concurrent-calls 800 --apply
 
 # 4) After reboot — verify all
 ./affinity_batch.sh --verify
 
-# Faster (parallel SSH)
-./affinity_batch.sh --apply --parallel
+# Continue only after checking the completed pair
+./affinity_batch.sh --pair DB --apply
 ```
 
 SSH user defaults to `root`. Override with `--user ameyo` or `SSH_USER=ameyo`.
 
 Primary and secondary in each pair get the **same role** so failover affinity matches.
+Inventory roles remain explicit and are never replaced by auto detection.
+`--concurrent-calls` and `--active-agents` can be passed through batch runs;
+only services managed by each inventory role use the relevant input.
+Production apply requires either `--host` or `--pair`; parallel apply is
+rejected. Pair apply stops immediately if the secondary fails, so the primary
+is not changed after a partial rollout.
 
 ## OS support
 
@@ -98,7 +161,10 @@ Primary and secondary in each pair get the **same role** so failover affinity ma
 | CentOS 6 / old AmeyOS | `/etc/grub.conf` |
 | CentOS 7+, RHEL 7+, Rocky 8/9 | `/etc/default/grub` + `grub2-mkconfig`, or direct `/boot/grub2/grub.cfg` |
 
-Works with or without an Ameyo `/dacx` tree (IRQ + grub still apply).
+Detection and dry-run work without an Ameyo tree. Apply is fail-closed: an
+existing writable `serviceCPUAffinityConf.csv` or `affinity.cfg` must be found
+before irqbalance, grub, or IRQ state is changed. The tool never creates a
+guessed affinity file.
 
 ## Custom profile
 
@@ -146,8 +212,41 @@ chmod +x affinity_tool.sh affinity_batch.sh install.sh
 
 - Default is **dry-run** (prints plan only)
 - Backs up grub / CSV / cfg with timestamp before write
+- Existing affinity configuration is merged, not replaced
+- Modern CSV output keeps Ameyo's semicolon CPU delimiter and has no header
+- CS/call updates `ASTERISK13` only and preserves the existing `ASTERISK` row
+- ASAP roles update both `ACP` and `ASAP`
+- DJINN itself is not pinned; it is restarted only after an atomic successful
+  config merge, and restart failure fails the host
 - Logs under `/var/tmp/affinity-tool/`
 - Reboot needed once for grub `default_affinity`
+
+## Pair rollout and verification
+
+Apply the secondary first and review it before allowing the batch command to
+continue to the primary. For PDB, PASAP, and PREPORT especially, run detection
+or a dry-run first to confirm which existing affinity path is selected.
+
+After each host, verify:
+
+```bash
+# Merged file: unrelated rows retained; managed rows use semicolon CPU lists
+sudo grep -E '^(APPSERVER|POSTGRESQL|AMEYOREPORTS|AMEYOARCHIVER|AMEYO_VOICELOGS_CONVERSION|CRM|DAGENT|ASTERISK13|ASAP|ACP),' \
+  /dacx/var/ameyo/dacxdata/etc/djinn/serviceCPUAffinityConf.csv
+
+# Managed processes and IRQs
+sudo taskset -cp <managed-service-pid>
+cat /proc/irq/<irq>/smp_affinity
+systemctl is-enabled irqbalance
+
+# A successful restart command is required. djinn.service may return inactive
+# with MainPID=0 because it is Type=forking and has no persistent DJINN process.
+systemctl status djinn.service
+
+# After the planned reboot
+grep -o 'default_affinity=[^ ]*' /proc/cmdline
+cat /proc/irq/default_smp_affinity
+```
 
 ## Manual checklist (if you only want the plan)
 

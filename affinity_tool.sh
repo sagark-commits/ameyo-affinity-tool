@@ -6,17 +6,25 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.4.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${AFFINITY_LOG_DIR:-/var/tmp/affinity-tool}"
 DACX_ROOT="${DACX_ROOT:-/dacx}"
 APPLY=0
 VERIFY_ONLY=0
 ROLE=""
+ROLE_REQUEST=""
+ROLE_EVIDENCE=""
+AUTO_ROLE_STATUS=""
+AUTO_ROLE_CANDIDATES=""
 PROFILE_FILE=""
 HAS_TELEPHONY=""
+CONCURRENT_CALLS=""
+ACTIVE_AGENTS=""
 REBOOT_HINT=0
 TS="$(date +%Y%m%d-%H%M%S)"
+AFFINITY_CONFIG_PATH=""
+AFFINITY_CONFIG_TYPE=""
 
 # Runtime state (filled by detect_*)
 OS_FAMILY=""
@@ -36,6 +44,8 @@ declare -a IRQ_TEL=()
 declare -A PLAN_IRQ=()           # irq -> cpu
 declare -A PLAN_IRQ_CLASS=()     # irq -> eth|disk|telephony
 declare -A PLAN_SVC=()           # service -> cpu list string
+declare -A PLAN_REASON=()        # service -> sizing explanation
+declare -a SERVICE_POOL=()       # physical-core primaries available to services
 DEFAULT_AFFINITY_CPU=0
 IRQ_CORES_MAX="${IRQ_CORES_MAX:-4}"   # max cores per multi-queue device class
 
@@ -47,7 +57,7 @@ Global CPU affinity planner/applier for Ameyo hosts (any CPU count).
 Supports CentOS / RHEL / Rocky. Dry-run by default.
 
 USAGE:
-  $0 --role <role> [--apply] [options]
+  $0 [--role <role|auto>] [--apply] [options]
   $0 --verify
   $0 --detect
 
@@ -60,15 +70,18 @@ ROLES:
   asap        Dedicated ASAP/ACP server
   call        Call server (Asterisk [+telephony])
   custom      Load --profile FILE
+  auto        Safely infer a role from active services, then hostname hints
 
 OPTIONS:
-  --role ROLE           Server role (required unless --verify/--detect)
+  --role ROLE           Explicit role, or auto (default: auto)
   --profile FILE        Custom profile (key=value). Used with --role custom
                         or to override a built-in role
   --apply               Write changes (default is dry-run / plan only)
   --verify              Check current affinity vs expectations
   --detect              Print OS/CPU/IRQ discovery only
   --telephony yes|no    Force telephony present/absent (auto-detect default)
+  --concurrent-calls N  Call workload used to size ASTERISK13
+  --active-agents N     Agent workload used to size CRM
   --dacx PATH           Ameyo root (default: /dacx)
   --log-dir PATH        Log directory (default: /var/tmp/affinity-tool)
   -h, --help            This help
@@ -76,6 +89,13 @@ OPTIONS:
 EXAMPLES:
   # Plan only (safe)
   sudo ./affinity_tool.sh --role single
+
+  # Auto-detect role and use conservative workload defaults
+  sudo ./affinity_tool.sh
+
+  # Workload-aware dedicated roles
+  sudo ./affinity_tool.sh --role call --concurrent-calls 800
+  sudo ./affinity_tool.sh --role app --active-agents 300
 
   # Apply on a Rocky call server
   sudo ./affinity_tool.sh --role call --apply
@@ -100,7 +120,6 @@ die()  { log "ERROR: $*"; exit 1; }
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root (sudo)"; }
 
 parse_args() {
-  [[ $# -gt 0 ]] || { usage; exit 1; }
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --role) ROLE="${2:-}"; shift 2 ;;
@@ -109,6 +128,8 @@ parse_args() {
       --verify) VERIFY_ONLY=1; shift ;;
       --detect) ROLE="detect"; shift ;;
       --telephony) HAS_TELEPHONY="${2:-}"; shift 2 ;;
+      --concurrent-calls) CONCURRENT_CALLS="${2:-}"; shift 2 ;;
+      --active-agents) ACTIVE_AGENTS="${2:-}"; shift 2 ;;
       --dacx) DACX_ROOT="${2:-}"; shift 2 ;;
       --log-dir) LOG_DIR="${2:-}"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
@@ -116,14 +137,21 @@ parse_args() {
     esac
   done
   if [[ $VERIFY_ONLY -eq 0 && "$ROLE" != "detect" ]]; then
-    [[ -n "$ROLE" ]] || die "--role is required (single|appdb|app|db|report|asap|call|custom)"
+    [[ -n "$ROLE" ]] || ROLE="auto"
     case "$ROLE" in
-      single|appdb|app|db|report|asap|call|custom|detect) ;;
+      single|appdb|app|db|report|asap|call|custom|auto|detect) ;;
       *) die "Invalid role: $ROLE" ;;
     esac
     if [[ "$ROLE" == "custom" && -z "$PROFILE_FILE" ]]; then
       die "--role custom requires --profile FILE"
     fi
+  fi
+  ROLE_REQUEST="$ROLE"
+  if [[ -n "$CONCURRENT_CALLS" && ! "$CONCURRENT_CALLS" =~ ^[0-9]+$ ]]; then
+    die "--concurrent-calls must be a non-negative integer"
+  fi
+  if [[ -n "$ACTIVE_AGENTS" && ! "$ACTIVE_AGENTS" =~ ^[0-9]+$ ]]; then
+    die "--active-agents must be a non-negative integer"
   fi
 }
 
@@ -144,7 +172,8 @@ detect_os() {
     # shellcheck disable=SC1091
     . /etc/os-release
     OS_FAMILY="${ID:-unknown}"
-    OS_MAJOR="${VERSION_ID%%.*}"
+    local version_id="${VERSION_ID:-0}"
+    OS_MAJOR="${version_id%%.*}"
   elif [[ -f /etc/redhat-release ]]; then
     local rel
     rel="$(cat /etc/redhat-release)"
@@ -392,6 +421,112 @@ detect_irqs() {
   log "IRQs eth=[${IRQ_ETH[*]:-}] disk=[${IRQ_DISK[*]:-}] tel=[${IRQ_TEL[*]:-}] telephony=$HAS_TELEPHONY"
 }
 
+# Infer only from active runtime evidence. The installed CSV is deliberately
+# ignored because generic Ameyo installations commonly contain every service.
+detect_role() {
+  local snapshot="${AFFINITY_PROCESS_SNAPSHOT:-}"
+  local host="${AFFINITY_HOSTNAME:-$(hostname)}"
+  local lower
+  local has_call=0 has_app=0 has_db=0 has_report=0 has_asap=0
+  local -a evidence=() candidates=()
+
+  AUTO_ROLE_CANDIDATES=""
+  ROLE_EVIDENCE=""
+  if [[ -z "${AFFINITY_PROCESS_SNAPSHOT+x}" ]]; then
+    snapshot="$(ps -eo comm=,args= 2>/dev/null || true)"
+    if command -v systemctl >/dev/null 2>&1; then
+      snapshot+=$'\n'"$(systemctl list-units --type=service --state=active --no-legend --no-pager 2>/dev/null || true)"
+    fi
+  fi
+  lower="$(printf '%s' "$snapshot" | tr '[:upper:]' '[:lower:]')"
+
+  if grep -Eq 'asterisk(13)?([[:space:]/.]|$)' <<< "$lower"; then
+    has_call=1; evidence+=("active ASTERISK")
+  fi
+  if grep -Eq '(^|[[:space:]/.-])appserver([[:space:]/.-]|$)' <<< "$lower"; then
+    has_app=1; evidence+=("active APPSERVER")
+  fi
+  if grep -Eq '(^|[[:space:]/.-])(postgres|postgresql)([[:space:]/.-]|$)' <<< "$lower"; then
+    has_db=1; evidence+=("active POSTGRESQL")
+  fi
+  if grep -Eq 'ameyoreports|ameyoarchiver|ameyo[_-]?voicelogs' <<< "$lower"; then
+    has_report=1; evidence+=("active report service")
+  fi
+  if grep -Eq '(^|[[:space:]/.-])(asap|acp)([[:space:]/.-]|$)' <<< "$lower"; then
+    has_asap=1; evidence+=("active ASAP/ACP")
+  fi
+
+  # Co-located combinations have a more specific role than their components.
+  if [[ $has_call -eq 1 && ( $has_app -eq 1 || $has_db -eq 1 ) ]]; then
+    candidates=(single)
+  elif [[ $has_app -eq 1 && $has_db -eq 1 && $has_report -eq 0 && $has_asap -eq 0 ]]; then
+    candidates=(appdb)
+  else
+    [[ $has_call -eq 1 ]] && candidates+=(call)
+    [[ $has_app -eq 1 ]] && candidates+=(app)
+    [[ $has_db -eq 1 ]] && candidates+=(db)
+    [[ $has_report -eq 1 ]] && candidates+=(report)
+    [[ $has_asap -eq 1 ]] && candidates+=(asap)
+  fi
+
+  if [[ ${#candidates[@]} -eq 1 ]]; then
+    ROLE="${candidates[0]}"
+    ROLE_EVIDENCE="$(IFS=', '; echo "${evidence[*]}")"
+    AUTO_ROLE_STATUS="active-service"
+    return 0
+  fi
+  if [[ ${#candidates[@]} -gt 1 ]]; then
+    AUTO_ROLE_CANDIDATES="$(IFS=,; echo "${candidates[*]}")"
+    ROLE_EVIDENCE="$(IFS=', '; echo "${evidence[*]}")"
+    AUTO_ROLE_STATUS="ambiguous-active-services"
+    return 1
+  fi
+
+  # Hostname hints are intentionally conservative and used only when no active
+  # service identifies the host. Split punctuation so "PAPP" and "SCS" remain
+  # useful while arbitrary substrings do not become role evidence.
+  lower="$(printf '%s' "$host" | tr '[:upper:]_' '[:lower:]-')"
+  case "$lower" in
+    *-papp|*-sapp|papp|sapp) candidates=(app) ;;
+    *-pdb|*-sdb|pdb|sdb) candidates=(db) ;;
+    *-preport|*-sreport|preport|sreport) candidates=(report) ;;
+    *-pcs|*-scs|pcs|scs|*-call|call-*) candidates=(call) ;;
+    *-pasap|*-sasap|pasap|sasap|*-asap|asap-*) candidates=(asap) ;;
+  esac
+  if [[ ${#candidates[@]} -eq 1 ]]; then
+    ROLE="${candidates[0]}"
+    ROLE_EVIDENCE="conservative hostname hint: $host"
+    AUTO_ROLE_STATUS="hostname-hint"
+    return 0
+  fi
+
+  AUTO_ROLE_STATUS="no-unambiguous-evidence"
+  ROLE_EVIDENCE="no unique active service or conservative hostname hint"
+  return 1
+}
+
+resolve_role() {
+  if [[ "$ROLE_REQUEST" != "auto" ]]; then
+    ROLE="$ROLE_REQUEST"
+    ROLE_EVIDENCE="explicit --role $ROLE"
+    AUTO_ROLE_STATUS="explicit"
+    return 0
+  fi
+  detect_role
+}
+
+print_role_detection_failure() {
+  echo
+  echo "========== ROLE DETECTION =========="
+  echo "Requested:   auto"
+  echo "Status:      $AUTO_ROLE_STATUS"
+  echo "Evidence:    $ROLE_EVIDENCE"
+  [[ -n "$AUTO_ROLE_CANDIDATES" ]] && echo "Candidates:  $AUTO_ROLE_CANDIDATES"
+  echo "Decision:    no affinity plan can be selected safely"
+  echo "Action:      re-run with explicit --role single|appdb|app|db|report|asap|call"
+  echo "===================================="
+}
+
 # Pick N distinct physical primaries, skipping reserved list
 pick_cores() {
   local need=$1
@@ -423,6 +558,26 @@ pool_drop() {
   fi
 }
 
+ceil_percent() {
+  local value=$1 percent=$2
+  echo $(( (value * percent + 99) / 100 ))
+}
+
+clamp_count() {
+  local value=$1 minimum=$2 maximum=$3 available=$4
+  [[ $value -lt $minimum ]] && value=$minimum
+  [[ $value -gt $maximum ]] && value=$maximum
+  [[ $value -gt $available ]] && value=$available
+  [[ $value -lt 1 && $available -gt 0 ]] && value=1
+  echo "$value"
+}
+
+first_pool_cores() {
+  local count=$1
+  local -a selected=("${SERVICE_POOL[@]:0:$count}")
+  (IFS=,; echo "${selected[*]}")
+}
+
 # -----------------------------------------------------------------------------
 # Planning — scales with CPU count
 # -----------------------------------------------------------------------------
@@ -430,6 +585,8 @@ plan_allocation() {
   PLAN_IRQ=()
   PLAN_IRQ_CLASS=()
   PLAN_SVC=()
+  PLAN_REASON=()
+  SERVICE_POOL=()
 
   local n_phys=${#PHYS_PRIMARY[@]}
   [[ $n_phys -ge 2 ]] || die "Need at least 2 physical cores (found $n_phys)"
@@ -563,12 +720,49 @@ plan_allocation() {
 
   local np=${#pool[@]}
 
-  # Role defaults
-  PLAN_SVC[tools]=0
-  PLAN_SVC[dagent]=0
+  # Keep the complete service pool: role-specific subsets intentionally overlap
+  # it. These are allowed CPU sets, not exclusive CPU partitions.
+  SERVICE_POOL=("${pool[@]}")
+  local service_pool_str dagent_str crm_str asterisk13_str
+  local n_dagent n_crm n_ast13 topology_crm requested
+  service_pool_str="$(IFS=,; echo "${SERVICE_POOL[*]}")"
+
+  # DAGENT is low demand: 15% of service cores, clamped to 2..3. This yields
+  # 2-3 physical cores on normal medium/large hosts.
+  requested="$(ceil_percent "$np" 15)"
+  n_dagent="$(clamp_count "$requested" 2 3 "$np")"
+  dagent_str="$(first_pool_cores "$n_dagent")"
+
+  # CRM defaults to a topology heuristic (35%, 2..5). An explicit agent count
+  # replaces that estimate at one physical core per 75 active agents.
+  topology_crm="$(ceil_percent "$np" 35)"
+  if [[ -n "$ACTIVE_AGENTS" ]]; then
+    requested=$(( (ACTIVE_AGENTS + 74) / 75 ))
+    n_crm="$(clamp_count "$requested" 2 5 "$np")"
+    PLAN_REASON[crm]="${ACTIVE_AGENTS} active agents / 75 per core, clamped to 2..5 and pool"
+  else
+    n_crm="$(clamp_count "$topology_crm" 2 5 "$np")"
+    PLAN_REASON[crm]="default ceil(35% of ${np}-core pool), clamped to 2..5"
+  fi
+  crm_str="$(first_pool_cores "$n_crm")"
+
+  # ASTERISK13 uses one physical core per 100 concurrent calls, with a two-core
+  # floor. Five hundred calls is the conservative omitted-input default.
+  local effective_calls="${CONCURRENT_CALLS:-500}"
+  requested=$(( (effective_calls + 99) / 100 ))
+  n_ast13="$(clamp_count "$requested" 2 "$np" "$np")"
+  asterisk13_str="$(first_pool_cores "$n_ast13")"
+  if [[ -n "$CONCURRENT_CALLS" ]]; then
+    PLAN_REASON[asterisk13]="${CONCURRENT_CALLS} concurrent calls / 100 per core, min 2, clamped to pool"
+  else
+    PLAN_REASON[asterisk13]="safe default 500 concurrent calls / 100 per core, min 2, clamped to pool"
+  fi
+  PLAN_REASON[dagent]="ceil(15% of ${np}-core pool), clamped to 2..3 and pool"
 
   case "$ROLE" in
     single)
+      PLAN_SVC[tools]=0
+      PLAN_SVC[dagent]=0
       # Postgres ~40% of remaining pool; asterisk 1–2 cores; rest to app/acp
       local n_db n_srv n_ast need_ast
       n_db=$(( (np * 40) / 100 )); [[ $n_db -lt 1 ]] && n_db=1
@@ -605,6 +799,8 @@ plan_allocation() {
       PLAN_SVC[ameyo_voicelogs_conversion]="$(IFS=,; echo "${srv_cores[*]}")"
       ;;
     appdb)
+      PLAN_SVC[tools]=0
+      PLAN_SVC[dagent]=0
       local n_db n_srv i
       n_db=$(( (np * 45) / 100 )); [[ $n_db -lt 1 ]] && n_db=1
       [[ $n_db -ge $np && $np -gt 1 ]] && n_db=$((np - 1))
@@ -624,58 +820,49 @@ plan_allocation() {
       PLAN_SVC[ameyoarchiver]="$(IFS=,; echo "${srv_cores[*]}")"
       ;;
     call)
-      local n_ast need i
-      n_ast=${#pool[@]}
-      [[ $n_ast -lt 1 ]] && n_ast=1
-      [[ $n_ast -gt 4 ]] && n_ast=4
-      local ast_cores=()
-      if [[ -n "$tel_cpu" ]]; then ast_cores+=("$tel_cpu"); fi
-      need=$(( n_ast - ${#ast_cores[@]} ))
-      [[ $need -lt 0 ]] && need=0
-      for ((i=0; i<need && i<${#pool[@]}; i++)); do ast_cores+=("${pool[$i]}"); done
-      pool_drop "$need"
-      if [[ ${#pool[@]} -gt 0 ]]; then
-        ast_cores+=("${pool[@]}")
-        pool=()
-      fi
-      PLAN_SVC[asterisk]="$(printf '%s\n' "${ast_cores[@]}" | sort -nu | paste -sd, -)"
+      # BLR CS is SIP-only. ASTERISK is deliberately left untouched.
+      PLAN_SVC[asterisk13]="$asterisk13_str"
+      PLAN_SVC[dagent]="$dagent_str"
       ;;
     app)
-      # Dedicated APP: most free cores to APPSERVER
-      local srv_cores=("${pool[@]}")
-      pool=()
-      [[ ${#srv_cores[@]} -eq 0 ]] && srv_cores=(1)
-      PLAN_SVC[server]="$(IFS=,; echo "${srv_cores[*]}")"
+      PLAN_SVC[server]="$service_pool_str"
+      PLAN_REASON[server]="main APP workload receives the full service pool"
+      PLAN_SVC[crm]="$crm_str"
+      PLAN_SVC[dagent]="$dagent_str"
       ;;
     db)
-      # Dedicated DB: almost all free cores to Postgres
-      local db_cores=("${pool[@]}")
-      pool=()
-      [[ ${#db_cores[@]} -eq 0 ]] && db_cores=(1)
-      PLAN_SVC[database]="$(IFS=,; echo "${db_cores[*]}")"
+      PLAN_SVC[database]="$service_pool_str"
+      PLAN_REASON[database]="main database workload receives the full service pool"
+      PLAN_SVC[dagent]="$dagent_str"
       ;;
     report)
-      local rep_cores=("${pool[@]}")
-      pool=()
-      [[ ${#rep_cores[@]} -eq 0 ]] && rep_cores=(1)
-      local rep_str
-      rep_str="$(IFS=,; echo "${rep_cores[*]}")"
-      PLAN_SVC[ameyoreports]="$rep_str"
-      PLAN_SVC[ameyoarchiver]="$rep_str"
-      PLAN_SVC[ameyo_voicelogs_conversion]="$rep_str"
+      PLAN_SVC[ameyoreports]="$service_pool_str"
+      PLAN_SVC[ameyoarchiver]="$service_pool_str"
+      PLAN_SVC[ameyo_voicelogs_conversion]="$service_pool_str"
+      PLAN_REASON[ameyoreports]="main report services receive the full service pool"
+      PLAN_REASON[ameyoarchiver]="main report services receive the full service pool"
+      PLAN_REASON[ameyo_voicelogs_conversion]="main report services receive the full service pool"
+      PLAN_SVC[crm]="$crm_str"
+      PLAN_SVC[dagent]="$dagent_str"
       ;;
     asap)
-      local asap_cores=("${pool[@]}")
-      pool=()
-      [[ ${#asap_cores[@]} -eq 0 ]] && asap_cores=(1)
-      PLAN_SVC[acp]="$(IFS=,; echo "${asap_cores[*]}")"
+      PLAN_SVC[asap]="$service_pool_str"
+      PLAN_SVC[acp]="$service_pool_str"
+      PLAN_REASON[asap]="main ASAP workload receives the full service pool"
+      PLAN_REASON[acp]="main ACP workload receives the full service pool"
+      PLAN_SVC[dagent]="$dagent_str"
       ;;
     custom)
+      PLAN_SVC[tools]=0
+      PLAN_SVC[dagent]=0
       local k
       for k in "${!OV[@]}"; do
         case "$k" in
           irq_*) ;;
-          *) PLAN_SVC[$k]="${OV[$k]}" ;;
+          *)
+            PLAN_SVC[$k]="${OV[$k]}"
+            PLAN_REASON[$k]="explicit profile allocation"
+            ;;
         esac
       done
       [[ -n "${PLAN_SVC[tools]:-}" ]] || PLAN_SVC[tools]=0
@@ -689,7 +876,10 @@ plan_allocation() {
     for k in "${!OV[@]}"; do
       case "$k" in
         irq_*) ;;
-        *) PLAN_SVC[$k]="${OV[$k]}" ;;
+        *)
+          PLAN_SVC[$k]="${OV[$k]}"
+          PLAN_REASON[$k]="explicit profile override"
+          ;;
       esac
     done
   fi
@@ -737,9 +927,18 @@ print_plan() {
   echo "========== AFFINITY PLAN =========="
   echo "Host:        $(hostname)"
   echo "OS:          $OS_FAMILY $OS_MAJOR ($GRUB_STYLE)"
-  echo "CPUs:        logical=$LOGICAL_CPUS physical_cores=${#PHYS_PRIMARY[@]} HT=$IS_HT"
+  echo "Topology:    logical=$LOGICAL_CPUS physical_cores=${#PHYS_PRIMARY[@]} packages=$PHYSICAL_CPUS HT=$IS_HT"
+  echo "Primaries:   ${PHYS_PRIMARY[*]}"
   echo "Role:        $ROLE  telephony=$HAS_TELEPHONY"
+  echo "Evidence:    $ROLE_EVIDENCE"
+  echo "Service pool (physical): $(IFS=,; echo "${SERVICE_POOL[*]}")"
+  echo "Inputs:      concurrent_calls=${CONCURRENT_CALLS:-500 (safe default)} active_agents=${ACTIVE_AGENTS:-topology default}"
   echo "Mode:        $([[ $APPLY -eq 1 ]] && echo APPLY || echo DRY-RUN)"
+  if discover_affinity_config; then
+    echo "Config:      $AFFINITY_CONFIG_PATH ($AFFINITY_CONFIG_TYPE)"
+  else
+    echo "Config:      MISSING (apply will fail preflight)"
+  fi
   echo
   echo "-- Default affinity (grub) --"
   echo "  CPU $DEFAULT_AFFINITY_CPU  mask=${CPU_HEX[$DEFAULT_AFFINITY_CPU]}"
@@ -773,6 +972,7 @@ print_plan() {
   local svc
   for svc in $(printf '%s\n' "${!PLAN_SVC[@]}" | sort); do
     echo "  $svc = ${PLAN_SVC[$svc]}"
+    [[ -n "${PLAN_REASON[$svc]:-}" ]] && echo "    why: ${PLAN_REASON[$svc]}"
   done
   echo "==================================="
   echo
@@ -920,32 +1120,63 @@ EOF
   rm -f "$tmp"
 }
 
-write_ameyo_service_affinity() {
+discover_affinity_config() {
   local csv="${DACX_ROOT}/var/ameyo/dacxdata/etc/djinn/serviceCPUAffinityConf.csv"
   local cfg="${DACX_ROOT}/var/ameyo/dacxdata/var/affinity.cfg"
-  local use=""
+  AFFINITY_CONFIG_PATH=""
+  AFFINITY_CONFIG_TYPE=""
 
-  if [[ -d "${DACX_ROOT}/var/ameyo" ]]; then
-    if [[ -f "$csv" ]] || [[ -d "$(dirname "$csv")" ]]; then
-      use="csv"
-    elif [[ -f "$cfg" ]] || [[ -d "$(dirname "$cfg")" ]]; then
-      use="cfg"
-    else
-      # Prefer CSV for modern Ameyo
-      use="csv"
-      mkdir -p "$(dirname "$csv")"
-    fi
+  if [[ -f "$csv" ]]; then
+    AFFINITY_CONFIG_PATH="$csv"
+    AFFINITY_CONFIG_TYPE="csv"
+  elif [[ -f "$cfg" ]]; then
+    AFFINITY_CONFIG_PATH="$cfg"
+    AFFINITY_CONFIG_TYPE="cfg"
   else
-    log "No Ameyo tree under $DACX_ROOT — skipping service affinity files"
-    return 0
+    return 1
   fi
+}
+
+preflight_apply() {
+  discover_affinity_config || die "Preflight failed: no existing affinity config (checked serviceCPUAffinityConf.csv and affinity.cfg)"
+  [[ -w "$AFFINITY_CONFIG_PATH" ]] || die "Preflight failed: affinity config is not writable: $AFFINITY_CONFIG_PATH"
+  [[ -w "$(dirname "$AFFINITY_CONFIG_PATH")" ]] || die "Preflight failed: affinity config directory is not writable: $(dirname "$AFFINITY_CONFIG_PATH")"
+  log "Preflight OK: existing writable $AFFINITY_CONFIG_TYPE config at $AFFINITY_CONFIG_PATH"
+}
+
+restart_djinn() {
+  log "Restarting DJINN after managed-service affinity merge (DJINN itself is not pinned)"
+  if [[ -n "${DJINN_RESTART_CMD:-}" ]]; then
+    bash -c "$DJINN_RESTART_CMD" || die "DJINN restart failed"
+  elif [[ -x /etc/init.d/djinn ]]; then
+    /etc/init.d/djinn restart || die "DJINN restart failed"
+  elif command -v systemctl >/dev/null 2>&1; then
+    systemctl restart djinn.service || die "DJINN restart failed"
+  else
+    die "DJINN restart failed: no init script or systemctl available"
+  fi
+  log "DJINN restart command completed successfully"
+}
+
+write_ameyo_service_affinity() {
+  if [[ -z "$AFFINITY_CONFIG_PATH" ]]; then
+    discover_affinity_config || {
+      log "WARN: no existing service affinity config found; no service changes planned"
+      return 0
+    }
+  fi
+  local use="$AFFINITY_CONFIG_TYPE"
+  local csv="$AFFINITY_CONFIG_PATH"
+  local cfg="$AFFINITY_CONFIG_PATH"
 
   # Map internal names -> CSV names from doc
   declare -A CSV_NAME=(
-    [tools]=TOOLS
     [acp]=ACP
+    [asap]=ASAP
     [dagent]=DAGENT
+    [crm]=CRM
     [asterisk]=ASTERISK
+    [asterisk13]=ASTERISK13
     [server]=APPSERVER
     [database]=POSTGRESQL
     [ameyoreports]=AMEYOREPORTS
@@ -954,58 +1185,111 @@ write_ameyo_service_affinity() {
   )
 
   if [[ "$use" == "csv" ]]; then
-    local tmp; tmp="$(mktemp)"
-    echo "SERVICE,CPU" > "$tmp"
-    local svc name
+    local tmp updates; tmp="$(mktemp "${csv}.tmp.XXXXXX")"; updates="$(mktemp)"
+    local svc name cpus
     for svc in "${!PLAN_SVC[@]}"; do
+      # Modern CSV has no TOOLS row; tools is an old affinity.cfg concept.
+      [[ "$svc" == "tools" ]] && continue
       name="${CSV_NAME[$svc]:-$(echo "$svc" | tr '[:lower:]' '[:upper:]')}"
-      # Skip empty
       [[ -n "${PLAN_SVC[$svc]}" ]] || continue
-      echo "${name},${PLAN_SVC[$svc]}" >> "$tmp"
+      # Existing Ameyo format is SERVICE,CPU;CPU (semicolon-separated CPUs).
+      cpus="${PLAN_SVC[$svc]//,/;}"
+      echo "${name},${cpus}" >> "$updates"
     done
+
+    # Replace only planned service rows and preserve every unrelated row,
+    # comment, blank line, and ordering. Append planned rows not already present.
+    awk -F, '
+        NR == FNR {
+          key=$1
+          replacement[key]=$0
+          order[++count]=key
+          next
+        }
+        {
+          if ($1 in replacement) {
+            print replacement[$1]
+            seen[$1]=1
+          } else {
+            print
+          }
+        }
+        END {
+          for (i=1; i<=count; i++) {
+            key=order[i]
+            if (!(key in seen)) print replacement[key]
+          }
+        }
+      ' "$updates" "$csv" > "$tmp"
+
     if [[ $APPLY -eq 1 ]]; then
-      mkdir -p "$(dirname "$csv")"
-      [[ -f "$csv" ]] && cp -a "$csv" "${csv}.bak.${TS}"
-      cp "$tmp" "$csv"
-      log "Wrote $csv"
-      if [[ -x /etc/init.d/djinn ]]; then
-        /etc/init.d/djinn restart || log "WARN: djinn restart failed"
-      elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q djinn; then
-        systemctl restart djinn || log "WARN: djinn restart failed"
-      else
-        log "NOTE: restart djinn manually to apply service affinity"
-      fi
+      cp -a "$csv" "${csv}.bak.${TS}"
+      chmod --reference="$csv" "$tmp" 2>/dev/null || true
+      chown --reference="$csv" "$tmp" 2>/dev/null || true
+      mv -f "$tmp" "$csv"
+      log "Merged planned service rows into $csv (backup: ${csv}.bak.${TS})"
     else
-      log "DRY-RUN CSV content:"
+      log "DRY-RUN merged CSV content:"
       cat "$tmp" >&2
     fi
-    rm -f "$tmp"
+    rm -f "$tmp" "$updates"
   else
-    local tmp; tmp="$(mktemp)"
-    {
-      echo "# Generated by affinity_tool.sh ${TS}"
-      local svc
-      for svc in tools acp dagent asterisk server database; do
-        if [[ -n "${PLAN_SVC[$svc]:-}" ]]; then
-          echo "-${svc} : ${PLAN_SVC[$svc]}"
-        fi
-      done
-    } > "$tmp"
+    local tmp updates; tmp="$(mktemp "${cfg}.tmp.XXXXXX")"; updates="$(mktemp)"
+    local svc
+    for svc in tools acp asap dagent asterisk asterisk13 server database crm ameyoreports ameyoarchiver ameyo_voicelogs_conversion; do
+      if [[ -n "${PLAN_SVC[$svc]:-}" ]]; then
+        printf '%s\t-%s : %s\n' "$svc" "$svc" "${PLAN_SVC[$svc]}" >> "$updates"
+      fi
+    done
+
+    # Merge old affinity.cfg rows too; never erase unrelated configuration.
+    awk -F '\t' '
+        NR == FNR {
+          replacement[$1]=$2
+          order[++count]=$1
+          next
+        }
+        {
+          line=$0
+          key=line
+          sub(/^[[:space:]]*-[[:space:]]*/, "", key)
+          sub(/[[:space:]]*:.*/, "", key)
+          if (key in replacement) {
+            print replacement[key]
+            seen[key]=1
+          } else {
+            print line
+          }
+        }
+        END {
+          for (i=1; i<=count; i++) {
+            key=order[i]
+            if (!(key in seen)) print replacement[key]
+          }
+        }
+      ' "$updates" "$cfg" > "$tmp"
+
     if [[ $APPLY -eq 1 ]]; then
-      mkdir -p "$(dirname "$cfg")"
-      [[ -f "$cfg" ]] && cp -a "$cfg" "${cfg}.bak.${TS}"
-      cp "$tmp" "$cfg"
-      log "Wrote $cfg"
+      cp -a "$cfg" "${cfg}.bak.${TS}"
+      chmod --reference="$cfg" "$tmp" 2>/dev/null || true
+      chown --reference="$cfg" "$tmp" 2>/dev/null || true
+      mv -f "$tmp" "$cfg"
+      log "Merged planned service rows into $cfg (backup: ${cfg}.bak.${TS})"
     else
-      log "DRY-RUN affinity.cfg:"
+      log "DRY-RUN merged affinity.cfg:"
       cat "$tmp" >&2
     fi
-    rm -f "$tmp"
+    rm -f "$tmp" "$updates"
+  fi
+  if [[ $APPLY -eq 1 ]]; then
+    restart_djinn
   fi
 }
 
 apply_all() {
   need_root
+  # This must remain the first mutating-flow step.
+  preflight_apply
   disable_irqbalance
   apply_grub
   write_irq_script
@@ -1022,7 +1306,14 @@ apply_all() {
 # Verify
 # -----------------------------------------------------------------------------
 verify_state() {
+  local verify_rc=0
   echo "========== VERIFY =========="
+  if discover_affinity_config; then
+    echo "OK  affinity config: $AFFINITY_CONFIG_PATH"
+  else
+    echo "FAIL affinity config not found"
+    verify_rc=1
+  fi
   if grep -q 'default_affinity=' /proc/cmdline 2>/dev/null; then
     echo "OK  default_affinity in cmdline: $(tr ' ' '\n' < /proc/cmdline | grep default_affinity)"
   else
@@ -1035,6 +1326,9 @@ verify_state() {
     else
       echo "OK  irqbalance not enabled"
     fi
+    echo "-- DJINN unit state (DJINN itself is not CPU-pinned) --"
+    systemctl show djinn.service -p Type -p ActiveState -p SubState -p MainPID 2>/dev/null || \
+      echo "WARN unable to read djinn.service state"
   fi
 
   echo "-- Sample IRQ affinities --"
@@ -1062,6 +1356,7 @@ verify_state() {
     echo "  (use: taskset -cp <pid> for each Ameyo service)"
   fi
   echo "============================"
+  return "$verify_rc"
 }
 
 print_detect() {
@@ -1085,6 +1380,11 @@ print_detect() {
   echo "  disk: ${IRQ_DISK[*]:-(none)}"
   echo "  tel:  ${IRQ_TEL[*]:-(none)}"
   echo "Ameyo:    $([[ -d $DACX_ROOT/var/ameyo ]] && echo "found under $DACX_ROOT" || echo "not found")"
+  if discover_affinity_config; then
+    echo "Affinity: $AFFINITY_CONFIG_PATH ($([[ -w "$AFFINITY_CONFIG_PATH" ]] && echo writable || echo read-only))"
+  else
+    echo "Affinity: not found (apply preflight would fail)"
+  fi
   echo "============================"
 }
 
@@ -1103,6 +1403,15 @@ main() {
 
   if [[ $VERIFY_ONLY -eq 1 ]]; then
     verify_state
+    exit 0
+  fi
+
+  if ! resolve_role; then
+    print_role_detection_failure
+    if [[ $APPLY -eq 1 ]]; then
+      die "Auto role detection is ambiguous; apply refused. Specify --role explicitly."
+    fi
+    echo "Dry-run stopped safely without selecting or applying an affinity plan."
     exit 0
   fi
 
