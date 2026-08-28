@@ -17,8 +17,9 @@ Dry-run by default. Safe to run with `--detect` on any box.
    - Merges role-specific rows into Ameyo `serviceCPUAffinityConf.csv` or
      `affinity.cfg` while preserving unrelated service rows
    - disables `irqbalance`
-   - on dedicated DB hosts without an Ameyo affinity file, manages PostgreSQL
-     and DJINN directly through systemd `CPUAffinity`
+   - on dedicated DB hosts, keeps an existing Ameyo CSV/cfg authoritative for
+     PostgreSQL and DAGENT while always pinning DJINN through systemd; direct
+     PostgreSQL systemd management is used only when CSV/cfg is absent
 
 ## Quick start (on the Linux server)
 
@@ -170,12 +171,13 @@ Detection and dry-run work without an Ameyo tree. Apply is fail-closed: an
 existing writable `serviceCPUAffinityConf.csv` or `affinity.cfg` must be found
 before irqbalance, grub, or IRQ state is changed, except for explicit `db`
 role when exactly one active, loaded `postgresql*.service` and an active,
-loaded `djinn.service` are available. The tool never creates a guessed
-affinity file.
+loaded `djinn.service` are available. Dedicated DB apply requires those units
+even when CSV/cfg exists. Other roles do not acquire this requirement. The tool
+never creates a guessed affinity file.
 
-## Dedicated DB native systemd runbook
+## Dedicated DB hybrid/native runbook
 
-On a dedicated DB server with no Ameyo affinity CSV/cfg, use:
+On a dedicated DB server, use:
 
 ```bash
 sudo ./affinity_tool.sh --role db
@@ -183,14 +185,25 @@ sudo ./affinity_tool.sh --role db --apply
 sudo ./affinity_tool.sh --verify --role db
 ```
 
-The backend rejects zero or multiple active `postgresql*.service` units rather
+An existing `serviceCPUAffinityConf.csv` (preferred) or `affinity.cfg` remains
+the authority for PostgreSQL and DAGENT. Only those two DB rows are merged;
+unrelated generic rows are preserved and ignored during DB verification.
+DJINN independently receives the DAGENT CPU subset through the tool-owned
+systemd drop-in. After both files are ready, systemd is reloaded and DJINN is
+restarted exactly once. PostgreSQL is not restarted; its live unit tasks must
+show the full service-pool affinity applied by DJINN/Ameyo.
+
+When neither CSV nor cfg exists, the native fallback manages both PostgreSQL
+and DJINN with systemd drop-ins. The backend rejects zero or multiple active
+`postgresql*.service` units rather
 than guessing (for example, production may resolve to
 `postgresql-14.service`). It writes tool-managed drop-ins named
 `90-ameyo-affinity.conf` below `/etc/systemd/system/<unit>.d/`, backing up an
 existing managed file before atomic replacement. PostgreSQL receives the full
 computed DB service pool; DJINN and DAGENT receive the dynamic DAGENT subset.
-Every current PostgreSQL cgroup task is updated and verified immediately.
-PostgreSQL is never restarted. DJINN is updated, restarted, and required to
+In native fallback, every current PostgreSQL cgroup task is updated and
+verified immediately. PostgreSQL is never restarted. DJINN is updated,
+restarted once, and required to
 return active with a persistent MainPID; exact DAGENT processes are then
 checked for DJINN cgroup membership and inherited affinity. A missing DAGENT is
 informational on a passive DB.
@@ -250,9 +263,10 @@ chmod +x affinity_tool.sh affinity_batch.sh install.sh
 - Modern CSV output keeps Ameyo's semicolon CPU delimiter and has no header
 - CS/call updates `ASTERISK13` only and preserves the existing `ASTERISK` row
 - ASAP roles update both `ACP` and `ASAP`
-- CSV/cfg roles restart DJINN after an atomic successful merge. The native DB
-  backend pins DJINN itself so DAGENT inherits the subset; restart failure is
-  fatal in both cases.
+- CSV/cfg roles restart DJINN after an atomic successful merge. For `db`, the
+  CSV/cfg and DJINN drop-in are prepared before one centralized restart; the
+  native fallback also performs only that restart. DJINN and exact DAGENT
+  processes must inherit the subset, while PostgreSQL must have the full pool.
 - All discovered IRQ writes are attempted. A rejected write is accepted only
   when its error is consistent with a kernel-managed IRQ (for example EIO,
   EINVAL, EBUSY, or EOPNOTSUPP) and its effective/current affinity is a valid,

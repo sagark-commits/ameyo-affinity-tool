@@ -6,7 +6,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${AFFINITY_LOG_DIR:-/var/tmp/affinity-tool}"
 DACX_ROOT="${DACX_ROOT:-/dacx}"
@@ -31,6 +31,7 @@ CGROUP_ROOT="${AFFINITY_CGROUP_ROOT:-/sys/fs/cgroup}"
 SYSTEMD_DROPIN_NAME="90-ameyo-affinity.conf"
 POSTGRES_UNIT=""
 DB_NATIVE_BACKEND=0
+DB_SYSTEMD_READY=0
 
 # Runtime state (filled by detect_*)
 OS_FAMILY=""
@@ -1287,20 +1288,39 @@ resolve_postgres_unit() {
 detect_db_native_backend() {
   DB_NATIVE_BACKEND=0
   [[ "$ROLE" == db ]] || return 1
-  resolve_postgres_unit || return 1
-  [[ "$(systemd_unit_property djinn.service LoadState)" == loaded ]] || return 1
-  [[ "$(systemd_unit_property djinn.service ActiveState)" == active ]] || return 1
+  detect_db_systemd_units || return 1
   DB_NATIVE_BACKEND=1
 }
 
+detect_db_systemd_units() {
+  DB_SYSTEMD_READY=0
+  [[ "$ROLE" == db ]] || return 1
+  resolve_postgres_unit || return 1
+  [[ "$(systemd_unit_property djinn.service LoadState)" == loaded ]] || return 1
+  [[ "$(systemd_unit_property djinn.service ActiveState)" == active ]] || return 1
+  DB_SYSTEMD_READY=1
+}
+
 preflight_apply() {
-  if ! discover_affinity_config; then
-    if detect_db_native_backend; then
+  if [[ "$ROLE" == db ]]; then
+    detect_db_systemd_units ||
+      die "Preflight failed: role=db requires one active PostgreSQL unit and loaded, active djinn.service"
+    [[ -d "$SYSTEMD_CONFIG_ROOT" && -w "$SYSTEMD_CONFIG_ROOT" ]] ||
+      die "Preflight failed: systemd config root is not writable: $SYSTEMD_CONFIG_ROOT"
+    if ! discover_affinity_config; then
+      DB_NATIVE_BACKEND=1
       [[ -d "$SYSTEMD_CONFIG_ROOT" && -w "$SYSTEMD_CONFIG_ROOT" ]] ||
         die "Preflight failed: systemd config root is not writable: $SYSTEMD_CONFIG_ROOT"
       log "Preflight OK: native DB backend (PostgreSQL=$POSTGRES_UNIT, DJINN=djinn.service)"
       return 0
     fi
+    DB_NATIVE_BACKEND=0
+    [[ -w "$AFFINITY_CONFIG_PATH" ]] || die "Preflight failed: affinity config is not writable: $AFFINITY_CONFIG_PATH"
+    [[ -w "$(dirname "$AFFINITY_CONFIG_PATH")" ]] || die "Preflight failed: affinity config directory is not writable: $(dirname "$AFFINITY_CONFIG_PATH")"
+    log "Preflight OK: $AFFINITY_CONFIG_TYPE DB backend plus native PostgreSQL=$POSTGRES_UNIT and DJINN"
+    return 0
+  fi
+  if ! discover_affinity_config; then
     die "Preflight failed: no affinity CSV/cfg and no unique active native DB backend"
   fi
   [[ -w "$AFFINITY_CONFIG_PATH" ]] || die "Preflight failed: affinity config is not writable: $AFFINITY_CONFIG_PATH"
@@ -1410,32 +1430,46 @@ verify_pid_affinity() {
   echo "FAIL $label pid=$pid expected=$expected actual=${live:-unreadable}"; return 1
 }
 
-apply_native_db_affinity() {
+apply_db_affinity() {
   local db_cpus="${PLAN_SVC[database]}" dagent_cpus="${PLAN_SVC[dagent]}"
-  [[ $DB_NATIVE_BACKEND -eq 1 ]] || detect_db_native_backend ||
-    die "Native DB backend disappeared after preflight"
-  write_systemd_affinity_dropin "$POSTGRES_UNIT" "$db_cpus"
+  [[ $DB_SYSTEMD_READY -eq 1 ]] || detect_db_systemd_units ||
+    die "DB systemd units disappeared after preflight"
+
+  if [[ $DB_NATIVE_BACKEND -eq 1 ]]; then
+    write_systemd_affinity_dropin "$POSTGRES_UNIT" "$db_cpus"
+  else
+    # The installed Ameyo file remains authoritative for PostgreSQL and DAGENT.
+    write_ameyo_service_affinity
+  fi
   write_systemd_affinity_dropin djinn.service "$dagent_cpus"
   systemctl daemon-reload || die "systemd daemon-reload failed"
-  # PostgreSQL must remain online: update every current cgroup task, never restart.
-  pin_unit_tasks "$POSTGRES_UNIT" "$db_cpus"
-  pin_unit_tasks djinn.service "$dagent_cpus"
+
+  # Native fallback must update PostgreSQL without downtime. With CSV/cfg,
+  # DJINN applies POSTGRESQL to the already-running native service on restart.
+  [[ $DB_NATIVE_BACKEND -eq 0 ]] || pin_unit_tasks "$POSTGRES_UNIT" "$db_cpus"
   restart_djinn
   [[ "$(systemd_unit_property djinn.service ActiveState)" == active ]] ||
     die "DJINN is not active after restart"
-  local main; main="$(systemd_unit_property djinn.service MainPID)"
+  local main
+  main="$(systemd_unit_property djinn.service MainPID)"
   [[ "$main" =~ ^[1-9][0-9]*$ ]] || die "DJINN has no persistent MainPID after restart"
-  pin_unit_tasks djinn.service "$dagent_cpus"
+  verify_pid_affinity DJINN "$main" "$dagent_cpus" >/dev/null ||
+    die "DJINN MainPID affinity mismatch after restart"
+  verify_unit_tasks "$POSTGRES_UNIT" "$db_cpus" >/dev/null ||
+    die "PostgreSQL live affinity mismatch; PostgreSQL was not restarted"
+  verify_unit_tasks djinn.service "$dagent_cpus" >/dev/null ||
+    die "DJINN cgroup affinity mismatch after restart"
+
   local pid count=0
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
     count=$((count + 1))
-    unit_has_pid djinn.service "$pid" || die "DAGENT pid=$pid is not in djinn.service cgroup"
+    unit_has_pid djinn.service "$pid" || die "DAGENT pid=$pid is outside djinn.service cgroup"
     verify_pid_affinity DAGENT "$pid" "$dagent_cpus" >/dev/null ||
-      die "DAGENT pid=$pid did not inherit DJINN affinity=$dagent_cpus"
+      die "DAGENT pid=$pid affinity mismatch"
   done < <(exact_dagent_pids)
   [[ $count -gt 0 ]] || log "INFO: DAGENT not running after DJINN restart (valid on passive DB)"
-  log "Native DB service affinity complete; PostgreSQL was not restarted"
+  log "DB affinity complete via $([[ $DB_NATIVE_BACKEND -eq 1 ]] && echo native-systemd || echo "$AFFINITY_CONFIG_TYPE+systemd"); PostgreSQL was not restarted"
 }
 
 restart_djinn() {
@@ -1575,7 +1609,7 @@ write_ameyo_service_affinity() {
     fi
     rm -f "$tmp" "$updates"
   fi
-  if [[ $APPLY -eq 1 ]]; then
+  if [[ $APPLY -eq 1 && "$ROLE" != db ]]; then
     restart_djinn
   fi
 }
@@ -1587,8 +1621,8 @@ apply_all() {
   disable_irqbalance
   apply_grub
   write_irq_script
-  if [[ $DB_NATIVE_BACKEND -eq 1 ]]; then
-    apply_native_db_affinity
+  if [[ "$ROLE" == db ]]; then
+    apply_db_affinity
   else
     write_ameyo_service_affinity
   fi
@@ -1751,11 +1785,17 @@ verify_state() {
     fi
   fi
 
-  if [[ $DB_NATIVE_BACKEND -eq 1 ]]; then
-    echo "-- Native DB systemd affinity --"
-    verify_systemd_dropin "$POSTGRES_UNIT" "${PLAN_SVC[database]}" || verify_rc=1
+  if [[ "$ROLE" == db ]]; then
+    detect_db_systemd_units || {
+      echo "FAIL role=db requires active PostgreSQL and loaded, active djinn.service"
+      verify_rc=1
+    }
+    echo "-- Dedicated DB live/systemd affinity --"
+    if [[ "$AFFINITY_CONFIG_TYPE" != csv && "$AFFINITY_CONFIG_TYPE" != cfg ]]; then
+      verify_systemd_dropin "$POSTGRES_UNIT" "${PLAN_SVC[database]}" || verify_rc=1
+      verify_systemd_effective "$POSTGRES_UNIT" "${PLAN_SVC[database]}" || verify_rc=1
+    fi
     verify_systemd_dropin djinn.service "${PLAN_SVC[dagent]}" || verify_rc=1
-    verify_systemd_effective "$POSTGRES_UNIT" "${PLAN_SVC[database]}" || verify_rc=1
     verify_systemd_effective djinn.service "${PLAN_SVC[dagent]}" || verify_rc=1
     verify_unit_tasks "$POSTGRES_UNIT" "${PLAN_SVC[database]}" || verify_rc=1
     verify_unit_tasks djinn.service "${PLAN_SVC[dagent]}" || verify_rc=1
