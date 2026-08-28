@@ -6,7 +6,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${AFFINITY_LOG_DIR:-/var/tmp/affinity-tool}"
 DACX_ROOT="${DACX_ROOT:-/dacx}"
@@ -26,6 +26,11 @@ TS="$(date +%Y%m%d-%H%M%S)"
 AFFINITY_CONFIG_PATH=""
 AFFINITY_CONFIG_TYPE=""
 MANAGED_STATE_PATH="${AFFINITY_MANAGED_STATE_PATH:-}"
+SYSTEMD_CONFIG_ROOT="${AFFINITY_SYSTEMD_CONFIG_ROOT:-/etc/systemd/system}"
+CGROUP_ROOT="${AFFINITY_CGROUP_ROOT:-/sys/fs/cgroup}"
+SYSTEMD_DROPIN_NAME="90-ameyo-affinity.conf"
+POSTGRES_UNIT=""
+DB_NATIVE_BACKEND=0
 
 # Runtime state (filled by detect_*)
 OS_FAMILY=""
@@ -937,6 +942,8 @@ print_plan() {
   echo "Mode:        $([[ $APPLY -eq 1 ]] && echo APPLY || echo DRY-RUN)"
   if discover_affinity_config; then
     echo "Config:      $AFFINITY_CONFIG_PATH ($AFFINITY_CONFIG_TYPE)"
+  elif detect_db_native_backend; then
+    echo "Config:      native systemd DB backend (PostgreSQL=$POSTGRES_UNIT, DJINN=djinn.service)"
   else
     echo "Config:      MISSING (apply will fail preflight)"
   fi
@@ -1254,15 +1261,185 @@ discover_affinity_config() {
   fi
 }
 
+systemd_unit_property() {
+  systemctl show "$1" -p "$2" --value 2>/dev/null
+}
+
+resolve_postgres_unit() {
+  local line unit load active
+  local -a candidates=()
+  command -v systemctl >/dev/null 2>&1 || return 1
+  while IFS= read -r line; do
+    unit="${line%%[[:space:]]*}"
+    [[ "$unit" == postgresql*.service ]] || continue
+    load="$(systemd_unit_property "$unit" LoadState)"
+    active="$(systemd_unit_property "$unit" ActiveState)"
+    [[ "$load" == loaded && "$active" == active ]] && candidates+=("$unit")
+  done < <(systemctl list-units 'postgresql*.service' --type=service --state=active --no-legend --no-pager 2>/dev/null || true)
+  mapfile -t candidates < <(printf '%s\n' "${candidates[@]:-}" | awk 'NF' | sort -u)
+  [[ ${#candidates[@]} -eq 1 ]] || {
+    [[ ${#candidates[@]} -gt 1 ]] && log "ERROR: ambiguous active PostgreSQL units: ${candidates[*]}"
+    return 1
+  }
+  POSTGRES_UNIT="${candidates[0]}"
+}
+
+detect_db_native_backend() {
+  DB_NATIVE_BACKEND=0
+  [[ "$ROLE" == db ]] || return 1
+  resolve_postgres_unit || return 1
+  [[ "$(systemd_unit_property djinn.service LoadState)" == loaded ]] || return 1
+  [[ "$(systemd_unit_property djinn.service ActiveState)" == active ]] || return 1
+  DB_NATIVE_BACKEND=1
+}
+
 preflight_apply() {
-  discover_affinity_config || die "Preflight failed: no existing affinity config (checked serviceCPUAffinityConf.csv and affinity.cfg)"
+  if ! discover_affinity_config; then
+    if detect_db_native_backend; then
+      [[ -d "$SYSTEMD_CONFIG_ROOT" && -w "$SYSTEMD_CONFIG_ROOT" ]] ||
+        die "Preflight failed: systemd config root is not writable: $SYSTEMD_CONFIG_ROOT"
+      log "Preflight OK: native DB backend (PostgreSQL=$POSTGRES_UNIT, DJINN=djinn.service)"
+      return 0
+    fi
+    die "Preflight failed: no affinity CSV/cfg and no unique active native DB backend"
+  fi
   [[ -w "$AFFINITY_CONFIG_PATH" ]] || die "Preflight failed: affinity config is not writable: $AFFINITY_CONFIG_PATH"
   [[ -w "$(dirname "$AFFINITY_CONFIG_PATH")" ]] || die "Preflight failed: affinity config directory is not writable: $(dirname "$AFFINITY_CONFIG_PATH")"
   log "Preflight OK: existing writable $AFFINITY_CONFIG_TYPE config at $AFFINITY_CONFIG_PATH"
 }
 
+cpu_list_spaces() { tr ',' ' ' <<< "$1"; }
+
+managed_dropin_path() {
+  printf '%s/%s.d/%s\n' "$SYSTEMD_CONFIG_ROOT" "$1" "$SYSTEMD_DROPIN_NAME"
+}
+
+write_systemd_affinity_dropin() {
+  local unit=$1 cpus=$2 path dir tmp backup=""
+  path="$(managed_dropin_path "$unit")"; dir="${path%/*}"
+  mkdir -p "$dir"
+  tmp="$(mktemp "${dir}/.${SYSTEMD_DROPIN_NAME}.XXXXXX")"
+  {
+    echo "# Managed by affinity_tool.sh v${VERSION}; role=db; generated=${TS}"
+    echo "[Service]"
+    echo "CPUAffinity=$(cpu_list_spaces "$cpus")"
+  } > "$tmp"
+  chmod 0644 "$tmp"
+  if [[ -e "$path" ]]; then
+    backup="${path}.bak.${TS}"
+    cp -a "$path" "$backup"
+  fi
+  mv -f "$tmp" "$path"
+  log "Persisted $unit CPUAffinity=$cpus at $path${backup:+ (backup: $backup)}"
+}
+
+unit_pids() {
+  local unit=$1 group main pid
+  group="$(systemd_unit_property "$unit" ControlGroup)"
+  if [[ -n "$group" && -r "${CGROUP_ROOT}${group}/cgroup.procs" ]]; then
+    sort -nu "${CGROUP_ROOT}${group}/cgroup.procs"
+    return
+  fi
+  main="$(systemd_unit_property "$unit" MainPID)"
+  [[ "$main" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$main"
+  if command -v pgrep >/dev/null 2>&1; then
+    local -a frontier=("$main") next=()
+    while [[ ${#frontier[@]} -gt 0 ]]; do
+      next=()
+      for pid in "${frontier[@]}"; do
+        while IFS= read -r pid; do [[ -n "$pid" ]] && { echo "$pid"; next+=("$pid"); }; done < <(pgrep -P "$pid" 2>/dev/null || true)
+      done
+      frontier=("${next[@]}")
+    done
+  fi
+}
+
+unit_has_pid() {
+  local unit=$1 wanted=$2 pid
+  while IFS= read -r pid; do [[ "$pid" == "$wanted" ]] && return 0; done < <(unit_pids "$unit")
+  return 1
+}
+
+normalize_cpu_list() {
+  local value=$1 part start end i
+  local -a expanded=() parts=()
+  value="${value// /,}"
+  IFS=, read -ra parts <<< "$value"
+  for part in "${parts[@]}"; do
+    if [[ "$part" == *-* ]]; then
+      start="${part%-*}"; end="${part#*-}"
+      for ((i=start; i<=end; i++)); do expanded+=("$i"); done
+    elif [[ -n "$part" ]]; then expanded+=("$part"); fi
+  done
+  printf '%s\n' "${expanded[@]}" | sort -n -u | paste -sd, -
+}
+
+pin_unit_tasks() {
+  local unit=$1 cpus=$2 pid live count=0
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    taskset -apc "$cpus" "$pid" >/dev/null || die "Failed to set $unit task pid=$pid affinity=$cpus"
+    live="$(taskset -cp "$pid" 2>/dev/null | awk -F: '{gsub(/ /,"",$NF); print $NF}')"
+    [[ "$(normalize_cpu_list "$live")" == "$(normalize_cpu_list "$cpus")" ]] ||
+      die "Affinity verification failed for $unit pid=$pid expected=$cpus actual=${live:-unreadable}"
+    count=$((count + 1))
+  done < <(unit_pids "$unit")
+  [[ $count -gt 0 ]] || die "No tasks found in active unit $unit"
+  log "Applied and verified $unit affinity=$cpus on $count task(s)"
+}
+
+exact_dagent_pids() {
+  local pid comm args exe first base
+  while read -r pid comm args; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    first="${args%%[[:space:]]*}"; base="${first##*/}"
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"; exe="${exe##*/}"
+    if [[ "${comm,,}" == dagent || "${base,,}" == dagent || "${exe,,}" == dagent ]]; then
+      echo "$pid"
+    fi
+  done < <(ps -eo pid=,comm=,args= 2>/dev/null || true)
+}
+
+verify_pid_affinity() {
+  local label=$1 pid=$2 expected=$3 live
+  live="$(taskset -cp "$pid" 2>/dev/null | awk -F: '{gsub(/ /,"",$NF); print $NF}')"
+  if [[ "$(normalize_cpu_list "$live")" == "$(normalize_cpu_list "$expected")" ]]; then
+    echo "OK  $label pid=$pid -> $live"; return 0
+  fi
+  echo "FAIL $label pid=$pid expected=$expected actual=${live:-unreadable}"; return 1
+}
+
+apply_native_db_affinity() {
+  local db_cpus="${PLAN_SVC[database]}" dagent_cpus="${PLAN_SVC[dagent]}"
+  [[ $DB_NATIVE_BACKEND -eq 1 ]] || detect_db_native_backend ||
+    die "Native DB backend disappeared after preflight"
+  write_systemd_affinity_dropin "$POSTGRES_UNIT" "$db_cpus"
+  write_systemd_affinity_dropin djinn.service "$dagent_cpus"
+  systemctl daemon-reload || die "systemd daemon-reload failed"
+  # PostgreSQL must remain online: update every current cgroup task, never restart.
+  pin_unit_tasks "$POSTGRES_UNIT" "$db_cpus"
+  pin_unit_tasks djinn.service "$dagent_cpus"
+  restart_djinn
+  [[ "$(systemd_unit_property djinn.service ActiveState)" == active ]] ||
+    die "DJINN is not active after restart"
+  local main; main="$(systemd_unit_property djinn.service MainPID)"
+  [[ "$main" =~ ^[1-9][0-9]*$ ]] || die "DJINN has no persistent MainPID after restart"
+  pin_unit_tasks djinn.service "$dagent_cpus"
+  local pid count=0
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    count=$((count + 1))
+    unit_has_pid djinn.service "$pid" || die "DAGENT pid=$pid is not in djinn.service cgroup"
+    verify_pid_affinity DAGENT "$pid" "$dagent_cpus" >/dev/null ||
+      die "DAGENT pid=$pid did not inherit DJINN affinity=$dagent_cpus"
+  done < <(exact_dagent_pids)
+  [[ $count -gt 0 ]] || log "INFO: DAGENT not running after DJINN restart (valid on passive DB)"
+  log "Native DB service affinity complete; PostgreSQL was not restarted"
+}
+
 restart_djinn() {
-  log "Restarting DJINN after managed-service affinity merge (DJINN itself is not pinned)"
+  log "Restarting DJINN after managed service-affinity update"
   if [[ -n "${DJINN_RESTART_CMD:-}" ]]; then
     bash -c "$DJINN_RESTART_CMD" || die "DJINN restart failed"
   elif [[ -x /etc/init.d/djinn ]]; then
@@ -1410,13 +1587,52 @@ apply_all() {
   disable_irqbalance
   apply_grub
   write_irq_script
-  write_ameyo_service_affinity
+  if [[ $DB_NATIVE_BACKEND -eq 1 ]]; then
+    apply_native_db_affinity
+  else
+    write_ameyo_service_affinity
+  fi
   log "Apply complete. Log: $LOG_FILE"
   if [[ $REBOOT_HINT -eq 1 ]]; then
     echo
     echo "*** Reboot required for grub default_affinity to take effect ***"
     echo "    After reboot: $0 --verify"
   fi
+}
+
+verify_systemd_dropin() {
+  local unit=$1 expected=$2 path actual
+  path="$(managed_dropin_path "$unit")"
+  actual="$(awk -F= '$1=="CPUAffinity" {print $2; exit}' "$path" 2>/dev/null || true)"
+  if [[ -n "$actual" && "$(normalize_cpu_list "$actual")" == "$(normalize_cpu_list "$expected")" ]]; then
+    echo "OK  $unit managed drop-in CPUAffinity=$expected"; return 0
+  fi
+  echo "FAIL $unit managed drop-in expected=$expected actual=${actual:-missing}"; return 1
+}
+
+verify_systemd_effective() {
+  local unit=$1 expected=$2 actual
+  actual="$(systemd_unit_property "$unit" CPUAffinity)"
+  if [[ -z "$actual" || "$actual" == "[not set]" ]]; then
+    echo "INFO $unit effective CPUAffinity unavailable from systemd"; return 0
+  fi
+  if [[ "$(normalize_cpu_list "$actual")" == "$(normalize_cpu_list "$expected")" ]]; then
+    echo "OK  $unit effective CPUAffinity=$actual"; return 0
+  fi
+  echo "FAIL $unit effective CPUAffinity expected=$expected actual=$actual"; return 1
+}
+
+verify_unit_tasks() {
+  local unit=$1 expected=$2 pid count=0 rc=0
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    count=$((count + 1))
+    verify_pid_affinity "$unit" "$pid" "$expected" || rc=1
+  done < <(unit_pids "$unit")
+  if [[ $count -eq 0 ]]; then
+    echo "FAIL $unit active cgroup has no tasks"; return 1
+  fi
+  return "$rc"
 }
 
 # -----------------------------------------------------------------------------
@@ -1433,8 +1649,10 @@ verify_state() {
   echo "========== VERIFY =========="
   if discover_affinity_config; then
     echo "OK  affinity config: $AFFINITY_CONFIG_PATH"
+  elif detect_db_native_backend; then
+    echo "OK  native DB backend: PostgreSQL=$POSTGRES_UNIT DJINN=djinn.service"
   else
-    echo "FAIL affinity config not found"
+    echo "FAIL affinity backend not found"
     verify_rc=1
   fi
   if grep -q 'default_affinity=' "$proc_cmdline" 2>/dev/null; then
@@ -1455,7 +1673,7 @@ verify_state() {
     else
       echo "OK  irqbalance not enabled"
     fi
-    echo "-- DJINN unit state (DJINN itself is not CPU-pinned) --"
+    echo "-- DJINN unit state --"
     systemctl show djinn.service -p Type -p ActiveState -p SubState -p MainPID 2>/dev/null || \
       echo "WARN unable to read djinn.service state"
     if systemctl is-enabled ameyo-affinity-irq.service >/dev/null 2>&1; then
@@ -1533,21 +1751,35 @@ verify_state() {
     fi
   fi
 
-  echo "-- Expected service process affinity --"
-  normalize_cpu_list() {
-    local value=$1 part start end i
-    local -a expanded=()
-    IFS=, read -ra parts <<< "$value"
-    for part in "${parts[@]}"; do
-      if [[ "$part" == *-* ]]; then
-        start="${part%-*}"; end="${part#*-}"
-        for ((i=start; i<=end; i++)); do expanded+=("$i"); done
-      elif [[ -n "$part" ]]; then
-        expanded+=("$part")
+  if [[ $DB_NATIVE_BACKEND -eq 1 ]]; then
+    echo "-- Native DB systemd affinity --"
+    verify_systemd_dropin "$POSTGRES_UNIT" "${PLAN_SVC[database]}" || verify_rc=1
+    verify_systemd_dropin djinn.service "${PLAN_SVC[dagent]}" || verify_rc=1
+    verify_systemd_effective "$POSTGRES_UNIT" "${PLAN_SVC[database]}" || verify_rc=1
+    verify_systemd_effective djinn.service "${PLAN_SVC[dagent]}" || verify_rc=1
+    verify_unit_tasks "$POSTGRES_UNIT" "${PLAN_SVC[database]}" || verify_rc=1
+    verify_unit_tasks djinn.service "${PLAN_SVC[dagent]}" || verify_rc=1
+    local djinn_main dagent_pid dagent_count=0
+    djinn_main="$(systemd_unit_property djinn.service MainPID)"
+    if [[ "$djinn_main" =~ ^[1-9][0-9]*$ ]]; then
+      echo "OK  DJINN persistent MainPID=$djinn_main"
+    else
+      echo "FAIL DJINN active unit has no persistent MainPID"; verify_rc=1
+    fi
+    while IFS= read -r dagent_pid; do
+      [[ -n "$dagent_pid" ]] || continue
+      dagent_count=$((dagent_count + 1))
+      if ! unit_has_pid djinn.service "$dagent_pid"; then
+        echo "FAIL DAGENT pid=$dagent_pid is outside djinn.service cgroup"; verify_rc=1
       fi
-    done
-    printf '%s\n' "${expanded[@]}" | sort -n -u | paste -sd, -
-  }
+      verify_pid_affinity DAGENT "$dagent_pid" "${PLAN_SVC[dagent]}" || verify_rc=1
+    done < <(exact_dagent_pids)
+    [[ $dagent_count -gt 0 ]] || echo "INFO DAGENT not-running (valid on passive DB)"
+    echo "============================"
+    return "$verify_rc"
+  fi
+
+  echo "-- Expected service process affinity --"
   local snapshot pids pid live found expected_cpus
   snapshot="$(ps -eo pid=,args= 2>/dev/null || true)"
   for svc in "${!PLAN_SVC[@]}"; do
@@ -1558,7 +1790,11 @@ verify_state() {
       ameyo_voicelogs_conversion) name='ameyo[_-]?voicelogs' ;;
       asterisk13) name='asterisk13|asterisk' ;; *) name="$svc" ;;
     esac
-    pids="$(awk -v IGNORECASE=1 -v pat="$name" '$0 ~ pat {print $1}' <<< "$snapshot")"
+    if [[ "$svc" == dagent ]]; then
+      pids="$(exact_dagent_pids)"
+    else
+      pids="$(awk -v IGNORECASE=1 -v pat="$name" '$0 ~ pat {print $1}' <<< "$snapshot")"
+    fi
     if [[ -z "$pids" ]]; then echo "INFO $svc not-running"; continue; fi
     found=0
     expected_cpus="$(normalize_cpu_list "${PLAN_SVC[$svc]}")"
@@ -1577,13 +1813,20 @@ one_hot_mask_cpu() {
   value="${value//[[:space:]]/}"
   [[ "$value" =~ ^[0-9a-fA-F]+$ ]] || return 1
   py="$(command -v python3 || command -v python || true)"
-  [[ -n "$py" ]] || return 1
-  "$py" - "$value" <<'PY'
+  if [[ -n "$py" ]]; then
+    "$py" - "$value" <<'PY'
 import sys
 n=int(sys.argv[1],16)
 if n <= 0 or n & (n-1): raise SystemExit(1)
 print(n.bit_length()-1)
 PY
+    return
+  fi
+  [[ ${#value} -le 15 ]] || return 1
+  local n=$((16#$value)) cpu=0
+  (( n > 0 && (n & (n - 1)) == 0 )) || return 1
+  while (( n > 1 )); do n=$((n >> 1)); cpu=$((cpu + 1)); done
+  echo "$cpu"
 }
 
 print_detect() {

@@ -17,6 +17,8 @@ Dry-run by default. Safe to run with `--detect` on any box.
    - Merges role-specific rows into Ameyo `serviceCPUAffinityConf.csv` or
      `affinity.cfg` while preserving unrelated service rows
    - disables `irqbalance`
+   - on dedicated DB hosts without an Ameyo affinity file, manages PostgreSQL
+     and DJINN directly through systemd `CPUAffinity`
 
 ## Quick start (on the Linux server)
 
@@ -166,8 +168,37 @@ is not changed after a partial rollout.
 
 Detection and dry-run work without an Ameyo tree. Apply is fail-closed: an
 existing writable `serviceCPUAffinityConf.csv` or `affinity.cfg` must be found
-before irqbalance, grub, or IRQ state is changed. The tool never creates a
-guessed affinity file.
+before irqbalance, grub, or IRQ state is changed, except for explicit `db`
+role when exactly one active, loaded `postgresql*.service` and an active,
+loaded `djinn.service` are available. The tool never creates a guessed
+affinity file.
+
+## Dedicated DB native systemd runbook
+
+On a dedicated DB server with no Ameyo affinity CSV/cfg, use:
+
+```bash
+sudo ./affinity_tool.sh --role db
+sudo ./affinity_tool.sh --role db --apply
+sudo ./affinity_tool.sh --verify --role db
+```
+
+The backend rejects zero or multiple active `postgresql*.service` units rather
+than guessing (for example, production may resolve to
+`postgresql-14.service`). It writes tool-managed drop-ins named
+`90-ameyo-affinity.conf` below `/etc/systemd/system/<unit>.d/`, backing up an
+existing managed file before atomic replacement. PostgreSQL receives the full
+computed DB service pool; DJINN and DAGENT receive the dynamic DAGENT subset.
+Every current PostgreSQL cgroup task is updated and verified immediately.
+PostgreSQL is never restarted. DJINN is updated, restarted, and required to
+return active with a persistent MainPID; exact DAGENT processes are then
+checked for DJINN cgroup membership and inherited affinity. A missing DAGENT is
+informational on a passive DB.
+
+This backend assumes only DJINN/DAGENT are launched in `djinn.service`, as in
+the verified dedicated-DB architecture. Because systemd CPU affinity is
+inherited, any other child launched there would receive the same restricted
+set. PostgreSQL is widened independently through its own unit.
 
 ## Custom profile
 
@@ -219,8 +250,9 @@ chmod +x affinity_tool.sh affinity_batch.sh install.sh
 - Modern CSV output keeps Ameyo's semicolon CPU delimiter and has no header
 - CS/call updates `ASTERISK13` only and preserves the existing `ASTERISK` row
 - ASAP roles update both `ACP` and `ASAP`
-- DJINN itself is not pinned; it is restarted only after an atomic successful
-  config merge, and restart failure fails the host
+- CSV/cfg roles restart DJINN after an atomic successful merge. The native DB
+  backend pins DJINN itself so DAGENT inherits the subset; restart failure is
+  fatal in both cases.
 - All discovered IRQ writes are attempted. A rejected write is accepted only
   when its error is consistent with a kernel-managed IRQ (for example EIO,
   EINVAL, EBUSY, or EOPNOTSUPP) and its effective/current affinity is a valid,
@@ -278,8 +310,8 @@ sudo taskset -cp <managed-service-pid>
 cat /proc/irq/<irq>/smp_affinity
 systemctl is-enabled irqbalance
 
-# A successful restart command is required. djinn.service may return inactive
-# with MainPID=0 because it is Type=forking and has no persistent DJINN process.
+# Native DB verification requires active djinn.service with a persistent
+# MainPID. CSV/cfg-backed legacy roles retain their existing service behavior.
 systemctl status djinn.service
 systemctl status ameyo-affinity-irq.service
 journalctl -u ameyo-affinity-irq.service
